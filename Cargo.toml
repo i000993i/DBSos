@@ -1,0 +1,9 @@
+[package]
+name = "dbsos-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = "0.35"
+dbsos-abi = { path = "../libs/dbsos-abi" }
+dbsos-console = { path = "../servers/console" }
