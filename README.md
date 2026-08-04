@@ -132,37 +132,37 @@ qemu-system-x86_64 \
 ## Архитектура
 
 ```
-┌─────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────┐
 │                    Limine Bootloader                 │
 │               (UEFI Application)                     │
-├─────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────┤
 │                    UEFI Firmware                     │
 │         (GOP, Memory Map, ACPI Tables)               │
-├─────────────────────────────────────────────────────┤
-│  Ring 0 (Kernel)                                    │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  init() — точка входа ядра                    │  │
-│  │  ├─ UEFI boot services                         │  │
-│  │  ├─ Memory + VM (PML4)                         │  │
-│  │  ├─ ACPI + Drivers (AHCI/NVMe)                 │  │
-│  │  ├─ ExitBootServices                           │  │
-│  │  ├─ GDT/IDT/PIC/LAPIC                          │  │
-│  │  ├─ IPC + Scheduler + Timer                    │  │
-│  │  ├─ Syscall (SYSCALL/SYSRET)                   │  │
-│  │  ├─ FS tests + Network tests                   │  │
-│  │  └─ Shell (interactive loop)                   │  │
-│  └───────────────────────────────────────────────┘  │
+├──────────────────────────────────────────────────────┤
+│  Ring 0 (Kernel)                                     │
+│  ┌───────────────────────────────────────────────┐   │
+│  │  init() — kernel entry point                  │   │
+│  │  ├─ UEFI boot services                        │   │
+│  │  ├─ Memory + VM (PML4)                        │   │
+│  │  ├─ ACPI + Drivers (AHCI/NVMe)                │   │
+│  │  ├─ ExitBootServices                          │   │
+│  │  ├─ GDT/IDT/PIC/LAPIC                         │   │
+│  │  ├─ IPC + Scheduler + Timer                   │   │
+│  │  ├─ Syscall (SYSCALL/SYSRET)                  │   │
+│  │  ├─ FS tests + Network tests                  │   │
+│  │  └─ Shell (interactive loop)                  │   │
+│  └───────────────────────────────────────────────┘   │
 │                                                      │
-│  Ring 3 (User Tasks)                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
-│  │ Console  │  │ e1000    │  │ ELF      │          │
-│  │ Server   │  │ Driver   │  │ Binary   │          │
-│  └──────────┘  └──────────┘  └──────────┘          │
-│        ↕ IPC (capabilities)                         │
-├─────────────────────────────────────────────────────┤
-│  Hardware / QEMU Emulation                          │
-│  LAPIC, HPET, NVMe, AHCI, e1000 NIC, PS/2          │
-└─────────────────────────────────────────────────────┘
+│  Ring 3 (User Tasks)                                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
+│  │ Console  │  │ e1000    │  │ ELF      │            │
+│  │ Server   │  │ Driver   │  │ Binary   │            │
+│  └──────────┘  └──────────┘  └──────────┘            │
+│        ↕ IPC (capabilities)                          │
+├──────────────────────────────────────────────────────┤
+│  Hardware / QEMU Emulation                           │
+│  LAPIC, HPET, NVMe, AHCI, e1000 NIC, PS/2            │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Ключевые принципы
