@@ -1,9 +1,13 @@
-[package]
-name = "dbsos-kernel"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "libs/*",
+    "servers/*",
+]
 
-[dependencies]
-uefi = "0.35"
-dbsos-abi = { path = "../libs/dbsos-abi" }
-dbsos-console = { path = "../servers/console" }
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

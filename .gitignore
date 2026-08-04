@@ -1,1 +1,18 @@
-/target
+# Build artifacts
+target/
+esp/
+
+# Logs
+*.log
+
+# Disk images
+*.img
+
+# Large archives
+limine-binary/
+limine-binary.tar.gz
+
+# Serial/debug logs
+serial.log
+qemu.log
+test_serial.log

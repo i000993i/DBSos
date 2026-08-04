@@ -1,0 +1,10 @@
+[package]
+name = "dbsos-console"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dbsos-abi = { path = "../../libs/dbsos-abi" }
+
+[lib]
+crate-type = ["lib"]
