@@ -254,33 +254,37 @@ pub unsafe fn identity_map_2mb(pml4: *mut u64, start: u64, end: u64, extra_flags
     true
 }
 
-/// Free all page table pages in the low half (indices 0-255) of a user address space.
-/// Does NOT free the physical pages mapped by leaf PTEs — those are tracked by the
-/// scheduler's Task struct (code_phys, user_stack_phys, etc.).
+/// Free all page table pages and mapped data pages in the low half (indices 0-255)
+/// of a user address space.
 pub unsafe fn destroy_address_space(pml4: *mut u64) {
     use crate::memory::pfree;
     for i in 0..256 {
         let e0 = get_pte(pml4, i);
         if e0 & PTE_PRESENT == 0 { continue; }
         let pdpt = table_from_phys(phys_from_pte(e0));
-        // Walk PDPT entries
         for j in 0..512 {
             let e1 = get_pte(pdpt, j);
             if e1 & PTE_PRESENT == 0 { continue; }
-            if e1 & PTE_HUGE != 0 { continue; } // 1GB huge page, skip
+            if e1 & PTE_HUGE != 0 { pfree(phys_from_pte(e1)); continue; }
             let pd = table_from_phys(phys_from_pte(e1));
-            // Walk PD entries
             for k in 0..512 {
                 let e2 = get_pte(pd, k);
                 if e2 & PTE_PRESENT == 0 { continue; }
-                if e2 & PTE_HUGE != 0 { continue; } // 2MB huge page, skip
-                pfree(phys_from_pte(e2)); // Free PT page
+                if e2 & PTE_HUGE != 0 { pfree(phys_from_pte(e2)); continue; }
+                let pt = table_from_phys(phys_from_pte(e2));
+                for l in 0..512 {
+                    let e3 = get_pte(pt, l);
+                    if e3 & PTE_PRESENT != 0 {
+                        pfree(phys_from_pte(e3));
+                    }
+                }
+                pfree(phys_from_pte(e2));
             }
-            pfree(phys_from_pte(e1)); // Free PD page
+            pfree(phys_from_pte(e1));
         }
-        pfree(phys_from_pte(e0)); // Free PDPT page
+        pfree(phys_from_pte(e0));
     }
-    pfree(pml4 as u64); // Free PML4 page
+    pfree(pml4 as u64);
 }
 
 /// Saved kernel PML4 physical address — restored when exiting a ring-3 task.

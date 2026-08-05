@@ -13,7 +13,7 @@ use crate::cap;
 const ANY_PARTNER: u64 = 0;
 
 /// Pending messages для self-send (когда отправитель == получатель)
-static mut PENDING: [u64; 32] = [0; 32];
+static mut PENDING: [Message; 32] = [const { Message::empty() }; 32];
 
 /// Разослать широковещательное уведомление всем задачам с данным capability
 pub fn broadcast(msg: &Message) {
@@ -50,7 +50,7 @@ pub fn send_with_cap(cap_idx: u16, msg: &Message) -> i64 {
 
         // Self-send: кладём в pending, не блокируемся
         if dst_slot == cur {
-            PENDING[cur] = msg as *const Message as u64;
+            PENDING[cur] = *msg;
             return IPC_OK;
         }
 
@@ -66,8 +66,8 @@ pub fn send_with_cap(cap_idx: u16, msg: &Message) -> i64 {
         // Блокируем отправителя
         TASKS[cur].state = TaskState::BlockedSend;
         TASKS[cur].ipc_partner = target_id;
-        let msg_ptr = msg as *const Message as u64;
-        TASKS[cur].ipc_val = msg_ptr;
+        TASKS[cur].ipc_msg = *msg;
+        TASKS[cur].ipc_val = 1;
         if TASKS[cur].ring3 { TASKS[cur].sys_ursave = crate::syscall::read_sys_ursave(); }
         scheduler::yield_now();
         IPC_OK
@@ -89,10 +89,9 @@ pub fn recv_with_cap(cap_idx: u16, buf: &mut Message) -> i64 {
         let cur_id = TASKS[cur].id;
 
         // Self-recv: проверяем pending
-        if PENDING[cur] != 0 {
-            let msg_ptr = PENDING[cur] as *const Message;
-            *buf = *msg_ptr;
-            PENDING[cur] = 0;
+        if PENDING[cur].msg_type != 0 {
+            *buf = PENDING[cur];
+            PENDING[cur] = Message::empty();
             return IPC_OK;
         }
 
@@ -101,8 +100,7 @@ pub fn recv_with_cap(cap_idx: u16, buf: &mut Message) -> i64 {
             if TASKS[i].state == TaskState::BlockedSend
                 && TASKS[i].ipc_partner == cur_id
             {
-                let msg_ptr = TASKS[i].ipc_val as *const Message;
-                *buf = *msg_ptr;
+                *buf = TASKS[i].ipc_msg;
                 TASKS[i].state = TaskState::Ready;
                 return IPC_OK;
             }
@@ -149,7 +147,8 @@ unsafe fn send_inner(dst_slot: usize, msg: &Message) -> i64 {
     } else {
         TASKS[cur].state = TaskState::BlockedSend;
         TASKS[cur].ipc_partner = dst_id;
-        TASKS[cur].ipc_val = msg as *const Message as u64;
+        TASKS[cur].ipc_msg = *msg;
+        TASKS[cur].ipc_val = 1;
         if TASKS[cur].ring3 { TASKS[cur].sys_ursave = crate::syscall::read_sys_ursave(); }
         scheduler::yield_now();
         IPC_OK

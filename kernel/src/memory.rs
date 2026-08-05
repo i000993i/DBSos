@@ -73,8 +73,10 @@ unsafe fn alloc_mut() -> &'static mut PhysAllocator {
 
 pub fn palloc() -> u64 {
     unsafe {
+        core::arch::asm!("cli");
         let a = alloc_mut();
         if a.free_pages == 0 || a.bitmap_addr.is_null() {
+            core::arch::asm!("sti");
             return 0;
         }
         for i in a.first_page..a.total_pages {
@@ -82,6 +84,7 @@ pub fn palloc() -> u64 {
                 bit_set(a.bitmap_addr, i, 1);
                 a.free_pages -= 1;
                 a.first_page = i + 1;
+                core::arch::asm!("sti");
                 return a.phys_start + (i as u64) * (PAGE_SIZE as u64);
             }
         }
@@ -89,17 +92,21 @@ pub fn palloc() -> u64 {
             if bit_test(a.bitmap_addr, i) == 0 {
                 bit_set(a.bitmap_addr, i, 1);
                 a.free_pages -= 1;
+                core::arch::asm!("sti");
                 return a.phys_start + (i as u64) * (PAGE_SIZE as u64);
             }
         }
+        core::arch::asm!("sti");
         0
     }
 }
 
 pub fn palloc_n(n: usize) -> u64 {
     unsafe {
+        core::arch::asm!("cli");
         let a = alloc_mut();
         if a.free_pages < n || a.bitmap_addr.is_null() {
+            core::arch::asm!("sti");
             return 0;
         }
         let mut run_start = a.first_page;
@@ -115,29 +122,41 @@ pub fn palloc_n(n: usize) -> u64 {
                     }
                     a.free_pages -= n;
                     a.first_page = run_start + n;
+                    core::arch::asm!("sti");
                     return a.phys_start + (run_start as u64) * (PAGE_SIZE as u64);
                 }
             } else {
                 run_len = 0;
             }
         }
+        core::arch::asm!("sti");
         0
     }
 }
 
 pub fn pfree(phys: u64) {
     unsafe {
+        core::arch::asm!("cli");
         let a = alloc_mut();
-        let offset = phys - a.phys_start;
+        let offset = match phys.checked_sub(a.phys_start) {
+            Some(o) => o,
+            None => { core::arch::asm!("sti"); return; }
+        };
         let page = (offset / (PAGE_SIZE as u64)) as usize;
         if page >= a.total_pages || a.bitmap_addr.is_null() {
+            core::arch::asm!("sti");
+            return;
+        }
+        if bit_test(a.bitmap_addr, page) == 0 {
+            core::arch::asm!("sti");
             return;
         }
         bit_set(a.bitmap_addr, page, 0);
-        a.free_pages += 1;
+        a.free_pages -= 1;
         if page < a.first_page {
             a.first_page = page;
         }
+        core::arch::asm!("sti");
     }
 }
 

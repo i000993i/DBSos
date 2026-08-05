@@ -62,7 +62,7 @@ pub fn init() {
             state: TaskState::Running,
             stack_base: 0 as *mut u8,
             sp: 0, id: 0,
-            ipc_partner: 0, ipc_val: 0,
+            ipc_partner: 0, ipc_val: 0, ipc_msg: Message::empty(),
             pml4: core::ptr::null_mut(), pml4_phys: 0,
             gdt_phys: 0, tss_phys: 0, ring3: false, sys_ursave: 0,
             code_phys: 0, user_stack_phys: 0, kstack_phys: 0, fpu_buf_phys: 0,
