@@ -121,6 +121,58 @@ fn find_nic() -> bool {
     false
 }
 
+/// Mark a physical MMIO region's leaf PTEs as uncacheable (CD|PWT) in the
+/// current page tables. Without this, MMIO writes are buffered in the CPU
+/// cache and never reach the NIC (reads first return the cached value, then
+/// 0 after a wbinvd). Handles 4KB and 2MB (and 1GB) huge leaf entries.
+fn make_mmio_uncacheable(base: u64, size: u64) {
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        let pml4 = cr3 as *mut u64;
+        const ADDR_MASK: u64 = 0x000FFFFFFFFFF000;
+        const PTE_CD: u64 = 1 << 4;
+        const PTE_PWT: u64 = 1 << 3;
+        const PTE_HUGE: u64 = 1 << 7;
+
+        let mut phys = base;
+        let end = base + size;
+        while phys < end {
+            let i0 = ((phys >> 39) & 0x1FF) as usize;
+            let i1 = ((phys >> 30) & 0x1FF) as usize;
+            let i2 = ((phys >> 21) & 0x1FF) as usize;
+            let i3 = ((phys >> 12) & 0x1FF) as usize;
+
+            let e0 = *pml4.add(i0);
+            if e0 & 1 != 0 {
+                let pdpt = (e0 & ADDR_MASK) as *mut u64;
+                let e1 = *pdpt.add(i1);
+                if e1 & 1 != 0 {
+                    if e1 & PTE_HUGE != 0 {
+                        *pdpt.add(i1) = e1 | PTE_CD | PTE_PWT;
+                    } else {
+                        let pd = (e1 & ADDR_MASK) as *mut u64;
+                        let e2 = *pd.add(i2);
+                        if e2 & 1 != 0 {
+                            if e2 & PTE_HUGE != 0 {
+                                *pd.add(i2) = e2 | PTE_CD | PTE_PWT;
+                            } else {
+                                let pt = (e2 & ADDR_MASK) as *mut u64;
+                                let e3 = *pt.add(i3);
+                                if e3 & 1 != 0 {
+                                    *pt.add(i3) = e3 | PTE_CD | PTE_PWT;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            core::arch::asm!("invlpg [{}]", in(reg) phys, options(nostack, preserves_flags));
+            phys += 0x1000;
+        }
+    }
+}
+
 /// Включить Bus Master + Memory/IO space в PCI Command Register
 fn pci_enable_bus_master() {
     unsafe {
@@ -578,8 +630,19 @@ impl Driver for E1000Driver {
             return DriverStatus::Unsupported;
         }
 
+        // Mark the BAR MMIO region uncacheable. UEFI may map PCI MMIO as
+        // write-back; without CD|PWT, writes to NIC registers never leave the
+        // CPU cache and DMA rings don't get configured (TDBAL/TCTL read 0).
+        make_mmio_uncacheable(unsafe { MMIO }, 128 * 1024);
+
         // Enable PCI master + memory space
         pci_enable_bus_master();
+
+        // DEBUG: which MMIO address did we pick?
+        let bar0 = unsafe { super::pci::read32(0, NIC_DEV, NIC_FUNC, 0x10) };
+        uart::write_str("[NET] bar0=0x"); uart_hex(bar0 as u64);
+        uart::write_str(" MMIO=0x"); uart_hex(unsafe { MMIO });
+        uart::write_str("\r\n");
 
         // Debug: read PCI command register
         let cmd_reg = unsafe { super::pci::read16(0, NIC_DEV, NIC_FUNC, 0x04) };
@@ -716,6 +779,22 @@ pub fn tx_test() {
         // Flush cache
         core::arch::asm!("wbinvd");
 
+        // DEBUG: verify ring registers were actually written to the NIC
+        {
+            uart::write_str("[NET] MMIO=0x"); uart_hex(MMIO);
+            uart::write_str(" CTRL=0x"); uart_hex(mmio_read32(REG_CTRL) as u64);
+            uart::write_str(" STATUS=0x"); uart_hex(mmio_read32(REG_STATUS) as u64);
+            uart::write_str("\r\n");
+            uart::write_str("[NET] TDBAL=0x"); uart_hex(mmio_read32(REG_TDBAL) as u64);
+            uart::write_str(" TDBAH=0x"); uart_hex(mmio_read32(REG_TDBAH) as u64);
+            uart::write_str(" TDLEN=0x"); uart_hex(mmio_read32(REG_TDLEN) as u64);
+            uart::write_str(" TCTL=0x"); uart_hex(mmio_read32(REG_TCTL) as u64);
+            uart::write_str("\r\n");
+            uart::write_str("[NET] ring_phys=0x"); uart_hex(TX_RING_PHYS);
+            uart::write_str(" buf0=0x"); uart_hex(TX_BUFS[0]);
+            uart::write_str("\r\n");
+        }
+
         // Ring doorbell
         mmio_write32(REG_TDT, 1);
 
@@ -739,6 +818,8 @@ pub fn tx_test() {
             uart::write_str(" oinfo_sta=0x"); uart_hex(desc.oinfo_sta as u64);
             uart::write_str(" TDH="); uart_dec(tdh as u64);
             uart::write_str(" TDT="); uart_dec(tdt as u64);
+            uart::write_str(" ICR=0x"); uart_hex(mmio_read32(0x00C0) as u64);
+            uart::write_str(" TXDCTL=0x"); uart_hex(mmio_read32(0x3828) as u64);
             uart::write_str("\r\n");
             break;
         }

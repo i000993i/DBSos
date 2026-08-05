@@ -129,6 +129,24 @@ core::arch::global_asm!(
     "  iretq",
 );
 
+// CPUID helper: reads CPUID leaf in EAX, returns EBX value through pointer in RDI
+// Must be global_asm because LLVM reserves RBX and inline asm can't touch it.
+core::arch::global_asm!(
+    ".globl cpuid_get_ebx",
+    "cpuid_get_ebx:",
+    "  push rbx",
+    "  mov eax, edi",
+    "  xor ecx, ecx",
+    "  cpuid",
+    "  mov [rsi], rbx",
+    "  pop rbx",
+    "  ret",
+);
+
+extern "C" {
+    fn cpuid_get_ebx(leaf: u32, out: *mut u64);
+}
+
 extern "C" {
     fn exc_stub_0();
     fn exc_stub_1();
@@ -183,6 +201,148 @@ fn hex32(v: u32) {
 
 #[no_mangle]
 fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: u64, saved_rflags: u64) {
+    // Page fault: vector 14 — handle specially
+    if vector == 14 {
+        let cr2: u64;
+        unsafe { asm!("mov {}, cr2", out(reg) cr2); }
+        let cr3: u64;
+        unsafe { asm!("mov {}, cr3", out(reg) cr3); }
+        // Page fault error code:
+        //   bit0 P  = 0 -> page not present
+        //   bit1 RW = 1 -> write
+        //   bit2 US = 1 -> access came from CPL 3 (user mode)
+        //             = 0 -> access came from CPL < 3 (supervisor/kernel)
+        // CS here is the *selector*, not the faulting CPL.  The USER bit is the
+        // authoritative signal of which privilege level performed the access.
+        let user = error_code & 4 != 0;
+        let present = error_code & 1 != 0;
+
+        crate::driver::uart::write_str("\r\n!!! #PF vec=14 ec=");
+        hex32(error_code as u32);
+        crate::driver::uart::write_str(" CR2=");
+        hex64(cr2);
+        crate::driver::uart::write_str(" CR3=");
+        hex64(cr3);
+        crate::driver::uart::write_str(" RIP=");
+        hex64(saved_rip);
+        crate::driver::uart::write_str(" CS=");
+        hex64(saved_cs);
+        crate::driver::uart::write_str(" [");
+        if !present { crate::driver::uart::write_str("PRESENT "); }
+        if error_code & 2 != 0 { crate::driver::uart::write_str("WRITE "); }
+        if user { crate::driver::uart::write_str("USER "); } else { crate::driver::uart::write_str("kernel-access "); }
+        if error_code & 8 != 0 { crate::driver::uart::write_str("RSVD "); }
+        if error_code & 16 != 0 { crate::driver::uart::write_str("FETCH "); }
+        crate::driver::uart::write_str("]\r\n");
+
+        // Diagnose: which task / address space is active, and walk the page
+        // table rooted at CR3 for the faulting address so we can see where the
+        // mapping is missing.
+        {
+            let hex = b"0123456789ABCDEF";
+            unsafe {
+            let cur = crate::scheduler::CURRENT;
+            crate::driver::uart::write_str("  task[");
+            crate::driver::uart::putchar(hex[((cur >> 4) & 0xF) as usize]);
+            crate::driver::uart::putchar(hex[(cur & 0xF) as usize]);
+            crate::driver::uart::write_str("].id=");
+            hex64(crate::scheduler::TASKS[cur].id);
+            crate::driver::uart::write_str(" ring3=");
+            if crate::scheduler::TASKS[cur].ring3 { crate::driver::uart::write_str("Y"); } else { crate::driver::uart::write_str("N"); }
+            crate::driver::uart::write_str(" task.pml4=");
+            hex64(crate::scheduler::TASKS[cur].pml4 as u64);
+            crate::driver::uart::write_str("\r\n");
+
+            // Walk the page table rooted at the faulting cr3 (read via identity map).
+            let p4 = cr3 as *const u64;
+            let e0 = *p4.add((cr2 >> 39) as usize & 0x1FF);
+            crate::driver::uart::write_str("  walk[PML4E=");
+            hex64(e0);
+            if e0 & 1 != 0 {
+                let p3 = (e0 & 0xFFFF_FFFF_F000) as *const u64;
+                let e1 = *p3.add((cr2 >> 30) as usize & 0x1FF);
+                crate::driver::uart::write_str("][PDPTE=");
+                hex64(e1);
+                if e1 & 1 != 0 {
+                    if e1 & (1 << 7) != 0 {
+                        crate::driver::uart::write_str("][1GB HUGE]\r\n");
+                    } else {
+                        let p2 = (e1 & 0xFFFF_FFFF_F000) as *const u64;
+                        // DEBUG: dump PD page contents (PDPTE points at the PD page)
+                        {
+                            let ph = b"0123456789ABCDEF";
+                            crate::driver::uart::write_str("\r\n  PDphys=0x");
+                            let v = p2 as u64;
+                            for i in (0..16).rev() { crate::driver::uart::putchar(ph[((v >> (i*4)) & 0xF) as usize]); }
+                            for k in 0..4 {
+                                let vv = *p2.add(k);
+                                crate::driver::uart::write_str(" PD[");
+                                crate::driver::uart::putchar(ph[((k >> 8) & 0xF) as usize]);
+                                crate::driver::uart::putchar(ph[((k >> 4) & 0xF) as usize]);
+                                crate::driver::uart::putchar(ph[(k & 0xF) as usize]);
+                                crate::driver::uart::write_str("]=");
+                                for i in (0..16).rev() { crate::driver::uart::putchar(ph[((vv >> (i*4)) & 0xF) as usize]); }
+                            }
+                            crate::driver::uart::write_str("\r\n");
+                        }
+                        let e2 = *p2.add((cr2 >> 21) as usize & 0x1FF);
+                        crate::driver::uart::write_str("][PDE=");
+                        hex64(e2);
+                        if e2 & 1 != 0 {
+                            if e2 & (1 << 7) != 0 {
+                                crate::driver::uart::write_str("][2MB HUGE]\r\n");
+                            } else {
+                                // DEBUG: dump the first few PD entries at the break point
+                                let hd2 = (e2 & 0xFFFF_FFFF_F000) as *const u64;
+                                let ph = b"0123456789ABCDEF";
+                                crate::driver::uart::write_str("\r\n  PDphys=0x");
+                                { let v = hd2 as u64; for i in (0..16).rev(){ crate::driver::uart::putchar(ph[((v>>(i*4))&0xF) as usize]); } }
+                                for k in 0..4 {
+                                    let v = *hd2.add(k);
+                                    crate::driver::uart::write_str(" PD[");
+                                    crate::driver::uart::putchar(ph[((k>>8)&0xF) as usize]);
+                                    crate::driver::uart::putchar(ph[((k>>4)&0xF) as usize]);
+                                    crate::driver::uart::putchar(ph[(k&0xF) as usize]);
+                                    crate::driver::uart::write_str("]=");
+                                    for i in (0..16).rev(){ crate::driver::uart::putchar(ph[((v>>(i*4))&0xF) as usize]); }
+                                }
+                                crate::driver::uart::write_str("\r\n");
+                                let p1 = (e2 & 0xFFFF_FFFF_F000) as *const u64;
+                                let e3 = *p1.add((cr2 >> 12) as usize & 0x1FF);
+                                crate::driver::uart::write_str("][PTE=");
+                                hex64(e3);
+                                if e3 & 1 != 0 {
+                                    crate::driver::uart::write_str("][phys=");
+                                    hex64(e3 & 0xFFFF_FFFF_F000 | (cr2 & 0xFFF));
+                                }
+                                crate::driver::uart::write_str("]\r\n");
+                            }
+                        } else {
+                            crate::driver::uart::write_str("][-]\r\n");
+                        }
+                    }
+                } else {
+                    crate::driver::uart::write_str("][-]\r\n");
+                }
+            } else {
+                crate::driver::uart::write_str("][-]\r\n");
+            }
+            }
+        }
+
+        // A real user-mode fault (US bit set) means the user process itself
+        // dereferenced a bad address: terminate that process only.
+        // A supervisor-access fault (US bit clear) is a kernel bug (e.g. wrong
+        // CR3 while reading user memory): do NOT kill a task for it — halt.
+        if user {
+            crate::driver::uart::write_str("  -> user-mode #PF, terminating process\r\n");
+            crate::scheduler::exit();
+        } else {
+            crate::driver::uart::write_str("  -> KERNEL #PF (supervisor access), HALTED\r\n");
+            loop { core::hint::spin_loop(); }
+        }
+    }
+
     let names = [
         "DE ", "DB ", "NMI", "BP ", "OF ", "BR ", "UD ", "NM ",
         "DF ", "CSO", "TS ", "NP ", "SS ", "GP ", "PF ", "RSV",
@@ -298,6 +458,142 @@ pub unsafe fn init() {
     asm!("lidt [{ptr}]", ptr = in(reg) &GdtPacked { limit: idt_limit, base: idt_base } as *const _ as u64);
 
     pic_remap();
+
+    crate::driver::uart::write_str("[CPU] enabling WP...\r\n");
+    // CR0.WP (bit 16): Write Protect — kernel cannot write user pages
+    {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1u64 << 16;
+        asm!("mov cr0, {}", in(reg) cr0);
+    }
+
+    // Before enabling SMEP, clear PTE_USER on all kernel identity-mapped pages.
+    // UEFI marks all pages as user-accessible; SMEP requires kernel pages to have US=0.
+    // Temporarily disable WP so we can modify page table entries.
+    crate::driver::uart::write_str("[CPU] clearing PTE_USER...\r\n");
+    {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1u64 << 16); // disable WP for page table edits
+        asm!("mov cr0, {}", in(reg) cr0);
+    }
+    let cr3: u64;
+    asm!("mov {}, cr3", out(reg) cr3);
+    let pml4 = cr3 as *mut u64;
+    let mut cleared: u64 = 0;
+    let mut made_writable: u64 = 0;
+    const PTE_ADDR: u64 = 0x000FFFFFFFFFF000; // bits 12-51
+    const PTE_RW: u64 = 1 << 1; // Read/Write bit
+
+    for i in 0..512 {
+        let e0 = *pml4.add(i);
+        if e0 & 1 == 0 { continue; }
+        // Ensure PML4->PDPT entries are writable (for future page table edits)
+        if e0 & PTE_RW == 0 { *pml4.add(i) = e0 | PTE_RW; made_writable += 1; }
+        let pdpt = (e0 & PTE_ADDR) as *mut u64;
+        for j in 0..512 {
+            let e1 = *pdpt.add(j);
+            if e1 & 1 == 0 { continue; }
+            if e1 & (1 << 7) != 0 {
+                if e1 & (1 << 2) != 0 { *pdpt.add(j) = e1 & !(1u64 << 2); cleared += 1; }
+                continue;
+            }
+            if e1 & PTE_RW == 0 { *pdpt.add(j) = e1 | PTE_RW; made_writable += 1; }
+            let pd = (e1 & PTE_ADDR) as *mut u64;
+            for k in 0..512 {
+                let e2 = *pd.add(k);
+                if e2 & 1 == 0 { continue; }
+                if e2 & (1 << 7) != 0 {
+                    if e2 & (1 << 2) != 0 { *pd.add(k) = e2 & !(1u64 << 2); cleared += 1; }
+                    continue;
+                }
+                if e2 & PTE_RW == 0 { *pd.add(k) = e2 | PTE_RW; made_writable += 1; }
+                let pt = (e2 & PTE_ADDR) as *mut u64;
+                for l in 0..512 {
+                    let e3 = *pt.add(l);
+                    if e3 & 1 == 0 { continue; }
+                    if e3 & (1 << 2) != 0 { *pt.add(l) = e3 & !(1u64 << 2); cleared += 1; }
+                    if e3 & PTE_RW == 0 { *pt.add(l) = e3 | PTE_RW; made_writable += 1; }
+                }
+            }
+        }
+    }
+
+    // Re-enable WP
+    {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1u64 << 16;
+        asm!("mov cr0, {}", in(reg) cr0);
+    }
+    // Flush TLB
+    asm!("mov cr3, {}", in(reg) cr3);
+    fn print_u64(mut v: u64) {
+        if v == 0 { crate::driver::uart::putchar(b'0'); return; }
+        let mut buf = [0u8; 20];
+        let mut n = 0;
+        while v > 0 { buf[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+        while n > 0 { n -= 1; crate::driver::uart::putchar(buf[n]); }
+    }
+    crate::driver::uart::write_str("[CPU] cleared PTE_USER=");
+    print_u64(cleared);
+    crate::driver::uart::write_str(" made_RW=");
+    print_u64(made_writable);
+    crate::driver::uart::write_str("\r\n");
+
+    // Flush TLB
+    asm!("mov cr3, {}", in(reg) cr3);
+
+    crate::driver::uart::write_str("[CPU] enabling SMEP...\r\n");
+    let hex = b"0123456789ABCDEF";
+
+    // Check SMEP support via CPUID leaf 7, EBX bit 7
+    let cpuid7_ebx: u32;
+    unsafe {
+        let mut store: u64 = 0;
+        cpuid_get_ebx(7, &mut store);
+        cpuid7_ebx = store as u32;
+    }
+    let smep_supported = (cpuid7_ebx >> 7) & 1 == 1;
+
+    crate::driver::uart::write_str("[CPU] CPUID.7:EBX=");
+    for i in (0..8).rev() {
+        crate::driver::uart::putchar(hex[((cpuid7_ebx >> (i*4)) & 0xF) as usize]);
+    }
+    crate::driver::uart::write_str(" SMEP=");
+    crate::driver::uart::putchar(if smep_supported { b'Y' } else { b'N' });
+    crate::driver::uart::write_str("\r\n");
+    if smep_supported {
+        // CR4.SMEP (bit 20): Supervisor Mode Execution Prevention
+        let mut cr4: u64;
+        unsafe { asm!("mov {}, cr4", out(reg) cr4); }
+        crate::driver::uart::write_str("[CPU] CR4 before=");
+        crate::driver::uart::putchar(hex[((cr4 >> 60) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 56) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 52) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 48) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 44) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 40) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 36) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 32) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 28) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 24) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 20) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 16) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 12) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 8) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[((cr4 >> 4) & 0xF) as usize]);
+        crate::driver::uart::putchar(hex[(cr4 & 0xF) as usize]);
+        crate::driver::uart::write_str("\r\n");
+        cr4 |= 1u64 << 20;
+        unsafe { asm!("mov cr4, {}", in(reg) cr4); }
+        crate::driver::uart::write_str("[CPU] SMEP enabled\r\n");
+    } else {
+        crate::driver::uart::write_str("[CPU] SMEP not supported, skipping\r\n");
+    }
+
+    crate::driver::uart::write_str("[CPU] Security: WP+SMEP done\r\n");
 }
 
 #[repr(C, packed)]

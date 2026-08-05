@@ -122,20 +122,27 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
                     uart_print("[ELF] map failed\r\n"); return 0;
                 }
             }
-        }
-
-        let orig_pml4 = unsafe { crate::vm::current_pml4() as *mut u64 };
-        unsafe { crate::vm::switch_to(pml4); }
-
-        unsafe {
-            let dst = vaddr as *mut u8;
-            core::ptr::copy_nonoverlapping(elf_buf.as_ptr().add(offset), dst, filesz);
-            if memsz > filesz {
-                core::ptr::write_bytes(dst.add(filesz), 0, memsz - filesz);
+            // Write segment data directly into the physical page (kernel identity
+            // map), so the user PTE keeps its final RX/RW flags.
+            let rel = page_virt - vaddr;
+            if rel < filesz as u64 {
+                let n = core::cmp::min(filesz as u64 - rel, 0x1000) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        elf_buf.as_ptr().add(offset + rel as usize),
+                        page_phys as *mut u8, n);
+                }
+            }
+            let z_lo = if rel >= filesz as u64 { rel } else { filesz as u64 };
+            let z_hi = core::cmp::min(rel + 0x1000, memsz as u64);
+            if z_hi > z_lo {
+                unsafe {
+                    core::ptr::write_bytes(
+                        (page_phys as *mut u8).add((z_lo - rel) as usize),
+                        0, (z_hi - z_lo) as usize);
+                }
             }
         }
-
-        unsafe { crate::vm::switch_to(orig_pml4); }
     }
 
     let orig = unsafe { crate::vm::current_pml4() as *mut u64 };

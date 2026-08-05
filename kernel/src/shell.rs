@@ -6,6 +6,57 @@ use crate::fs;
 use crate::memory;
 use crate::timer;
 
+/// Current working directory (absolute path, starts at root "/")
+static mut CWD: [u8; 128] = [0; 128];
+
+fn cwd_init() {
+    unsafe {
+        CWD[0] = b'/';
+        CWD[1] = 0;
+    }
+}
+
+fn cwd_get() -> &'static [u8] {
+    unsafe { &CWD[..] }
+}
+
+const CWD_SIZE: usize = 256;
+
+fn cwd_set(path: &[u8]) {
+    unsafe {
+        let len = path.len().min(CWD_SIZE - 1);
+        CWD[..len].copy_from_slice(&path[..len]);
+        CWD[len] = 0;
+    }
+}
+
+/// Build absolute path: if `path` starts with '/', use as-is; else prepend cwd
+fn build_path<'a>(path: &[u8], buf: &'a mut [u8]) -> &'a mut [u8] {
+    if path.len() > 0 && path[0] == b'/' {
+        let len = path.len().min(buf.len() - 1);
+        buf[..len].copy_from_slice(&path[..len]);
+        buf[len] = 0;
+        &mut buf[..len + 1]
+    } else {
+        let cwd = cwd_get();
+        let cwd_len = cwd.len().min(buf.len() - path.len() - 2);
+        buf[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
+        if cwd_len > 1 {
+            buf[cwd_len] = b'/';
+            let start = cwd_len + 1;
+            let copy_len = path.len().min(buf.len() - start - 1);
+            buf[start..start + copy_len].copy_from_slice(&path[..copy_len]);
+            buf[start + copy_len] = 0;
+            &mut buf[..start + copy_len + 1]
+        } else {
+            let copy_len = path.len().min(buf.len() - 1);
+            buf[..copy_len].copy_from_slice(&path[..copy_len]);
+            buf[copy_len] = 0;
+            &mut buf[..copy_len + 1]
+        }
+    }
+}
+
 fn w(s: &str) { console::write_str(s); uart::write_str(s); }
 
 fn readline(buf: &mut [u8]) -> usize {
@@ -23,6 +74,11 @@ fn readline(buf: &mut [u8]) -> usize {
                 b'\r' | b'\n' => {
                     w("\r\n"); buf[i] = 0; return i;
                 }
+                0x03 => { // Ctrl+C
+                    w("^C\r\n");
+                    buf[0] = 0;
+                    return 0;
+                }
                 0x7F | 0x08 => {
                     if i > 0 { i -= 1; w("\x08 \x08"); }
                 }
@@ -38,13 +94,6 @@ fn readline(buf: &mut [u8]) -> usize {
             }
         }
     }
-}
-
-fn strcmp(a: &[u8], b: &str) -> bool {
-    let b = b.as_bytes();
-    if a.len() < b.len() { return false; }
-    for i in 0..b.len() { if a[i] != b[i] { return false; } }
-    a[b.len()] == 0 || a[b.len()] == b' '
 }
 
 fn dec(mut v: u64) {
@@ -70,6 +119,90 @@ fn cmd_help() {
     w("  rmdir PATH  - delete dir\r\n  ping   - ARP ping\r\n");
     w("  reboot - restart system\r\n  poweroff - shutdown\r\n");
     w("  exec PATH   - run ELF binary\r\n");
+    w("  cd PATH     - change directory\r\n  pwd    - print working dir\r\n");
+    w("  echo TEXT   - print text\r\n");
+}
+
+fn cmd_pwd() {
+    let cwd = cwd_get();
+    if cwd.len() == 0 || (cwd.len() == 1 && cwd[0] == b'/') {
+        w("/");
+    } else {
+        let s = core::str::from_utf8(cwd).unwrap_or("?");
+        w(s);
+    }
+    w("\r\n");
+}
+
+fn cmd_cd(arg: &[u8]) {
+    if arg.len() == 0 {
+            // cd without args -> go to root
+            cwd_set(b"/");
+            return;
+        }
+        let mut path_buf = [0u8; 256];
+        let abs_path = build_path(arg, &mut path_buf);
+
+        // Resolve the path: handle ".." and "."
+        let mut resolved = [0u8; 128];
+        let mut rpos = 0;
+
+        let mut i = 0;
+        while i < abs_path.len() && abs_path[i] != 0 {
+            // Skip leading slashes
+            while i < abs_path.len() && abs_path[i] == b'/' { i += 1; }
+            if i >= abs_path.len() || abs_path[i] == 0 { break; }
+
+            // Extract component
+            let start = i;
+            while i < abs_path.len() && abs_path[i] != b'/' && abs_path[i] != 0 { i += 1; }
+            let comp = &abs_path[start..i];
+
+            if comp == b".." {
+                // Go up: remove last component
+                if rpos > 1 {
+                    rpos -= 1; // remove trailing slash
+                    while rpos > 0 && resolved[rpos - 1] != b'/' { rpos -= 1; }
+                    if rpos > 0 { rpos -= 1; } // remove the slash itself
+                    if rpos == 0 { resolved[0] = b'/'; rpos = 1; }
+                } else {
+                    resolved[0] = b'/';
+                    rpos = 1;
+                }
+        } else if comp != b"." {
+            // Add component
+            if rpos > 0 && resolved[rpos - 1] != b'/' {
+                if rpos < resolved.len() { resolved[rpos] = b'/'; rpos += 1; }
+            }
+            let copy_len = comp.len().min(resolved.len() - rpos - 1);
+            resolved[rpos..rpos + copy_len].copy_from_slice(&comp[..copy_len]);
+            rpos += copy_len;
+        }
+    }
+
+    if rpos == 0 {
+        resolved[0] = b'/';
+        rpos = 1;
+    }
+    resolved[rpos] = 0;
+
+    // Verify the directory exists
+    if fs::is_dir(&resolved[..rpos]) {
+        cwd_set(&resolved[..rpos]);
+    } else {
+        w("cd: not a directory: ");
+        let s = core::str::from_utf8(arg).unwrap_or("?");
+        w(s);
+        w("\r\n");
+    }
+}
+
+fn cmd_echo(arg: &[u8]) {
+    if arg.len() > 0 {
+        let s = core::str::from_utf8(arg).unwrap_or("<binary>");
+        w(s);
+    }
+    w("\r\n");
 }
 
 fn cmd_mem() {
@@ -99,15 +232,6 @@ fn cmd_ping() {
     let deadline = timer::millis() + 2000;
     while timer::millis() < deadline { net::poll(); core::hint::spin_loop(); }
     w("[NET] poll done\r\n");
-}
-
-fn parse_arg(buf: &[u8]) -> &[u8] {
-    let mut i = 0;
-    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
-    while buf[i] == b' ' { i += 1; }
-    let start = i;
-    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
-    &buf[start..i]
 }
 
 const DARK_RED: u32 = 0x00880000;
@@ -168,8 +292,18 @@ fn hex32(v: u32) {
     for i in (0..8).rev() { let n = (v >> (i * 4)) & 0xF; uart::putchar(h[n as usize]); console::putchar(h[n as usize]); }
 }
 
+/// Parse first word from a null-terminated buffer (skipping the command name)
+fn parse_first_arg(buf: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
+    while buf[i] == b' ' { i += 1; }
+    let start = i;
+    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
+    &buf[start..i]
+}
+
 fn cmd_nvme(buf: &[u8]) {
-    let sub = parse_arg(&buf);
+    let sub = parse_first_arg(&buf);
     if sub.len() == 0 { w("nvme: missing subcommand (info|read|write)\r\n"); return; }
     if sub[0] == b'i' { // info
         if unsafe { nvme::INIT } {
@@ -234,6 +368,7 @@ fn parse_two_ints(buf: &[u8]) -> (u32, u32) {
 }
 
 pub fn run() {
+    cwd_init();
     console::clear_screen();
     draw_logo();
 
@@ -242,89 +377,79 @@ pub fn run() {
 
     loop {
         net::poll();
-        w("\r\nDBSos> ");
+        // Show prompt with cwd
+        w("\r\n");
+        let cwd = cwd_get();
+        if cwd.len() <= 1 {
+            w("DBSos:/ > ");
+        } else {
+            w("DBSos:");
+            let s = core::str::from_utf8(cwd).unwrap_or("/");
+            w(s);
+            w("> ");
+        }
         let mut buf = [0u8; 128];
-        let _ = readline(&mut buf);
+        let len = readline(&mut buf);
 
-        if strcmp(&buf, "help") { cmd_help(); }
-        else if strcmp(&buf, "mem") { cmd_mem(); }
-        else if strcmp(&buf, "time") { cmd_time(); }
-        else if strcmp(&buf, "clear") { console::clear_screen(); draw_logo(); console::set_cursor(0, 12); }
-        else if strcmp(&buf, "info") { cmd_info(); }
-        else if strcmp(&buf, "ls") { fs::ls(); }
-        else if buf.len() >= 3 && buf[0] == b'l' && buf[1] == b's' && buf[2] == b' ' {
-            let arg = parse_arg(&buf);
-            if arg.len() > 0 { fs::ls_path(arg); } else { w("Usage: ls PATH\r\n"); }
+        if len == 0 || buf[0] == 0 { continue; }
+
+        // Parse: split into command and args
+        let cmd_end = buf[..len].iter().position(|&c| c == b' ').unwrap_or(len);
+        let cmd = &buf[..cmd_end];
+        let arg_start = if cmd_end < len { cmd_end + 1 } else { cmd_end };
+        let arg = &buf[arg_start..len];
+
+        if cmd == b"help" { cmd_help(); }
+        else if cmd == b"mem" { cmd_mem(); }
+        else if cmd == b"time" { cmd_time(); }
+        else if cmd == b"clear" { console::clear_screen(); draw_logo(); console::set_cursor(0, 12); }
+        else if cmd == b"info" { cmd_info(); }
+        else if cmd == b"pwd" { cmd_pwd(); }
+        else if cmd == b"cd" { cmd_cd(arg); }
+        else if cmd == b"echo" { cmd_echo(arg); }
+        else if cmd == b"ls" {
+            if arg.len() > 0 { fs::ls_path(arg); } else { fs::ls(); }
         }
-        else if strcmp(&buf, "ping") { cmd_ping(); }
-        else if strcmp(&buf, "reboot") { w("Rebooting...\r\n"); crate::acpi::reboot(); }
-        else if strcmp(&buf, "poweroff") { w("Shutting down...\r\n"); crate::acpi::shutdown(); }
-        else if buf.len() >= 8 && buf[0] == b'n' && buf[1] == b'v' && buf[2] == b'm' && buf[3] == b'e' && buf[4] == b' ' {
-            cmd_nvme(&buf);
+        else if cmd == b"cat" {
+            if arg.len() > 0 { fs::cat_path(arg); } else { w("Usage: cat PATH\r\n"); }
         }
-        else if buf[0] == 0 { continue; }
+        else if cmd == b"mkdir" {
+            if arg.len() > 0 { fs::mkdir(arg); } else { w("Usage: mkdir PATH\r\n"); }
+        }
+        else if cmd == b"rm" {
+            if arg.len() > 0 { fs::rm(arg); } else { w("Usage: rm PATH\r\n"); }
+        }
+        else if cmd == b"rmdir" {
+            if arg.len() > 0 { fs::rmdir(arg); } else { w("Usage: rmdir PATH\r\n"); }
+        }
+        else if cmd == b"write" {
+            if arg.len() > 0 {
+                // Extract content after the path
+                let space = arg.iter().position(|&c| c == b' ');
+                match space {
+                    Some(s) => {
+                        let path = &arg[..s];
+                        let content = &arg[s + 1..];
+                        let content_len = content.iter().position(|&c| c == 0).unwrap_or(content.len());
+                        fs::write_file(path, &content[..content_len]);
+                    }
+                    None => { w("Usage: write PATH TEXT\r\n"); }
+                }
+            } else { w("Usage: write PATH TEXT\r\n"); }
+        }
+        else if cmd == b"exec" {
+            if arg.len() > 0 { crate::elf::load_and_spawn(arg); }
+            else { w("Usage: exec PATH\r\n"); }
+        }
+        else if cmd == b"ping" { cmd_ping(); }
+        else if cmd == b"reboot" { w("Rebooting...\r\n"); crate::acpi::reboot(); }
+        else if cmd == b"poweroff" { w("Shutting down...\r\n"); crate::acpi::shutdown(); }
+        else if cmd == b"nvme" { cmd_nvme(&buf); }
         else {
-            let mut is_cat = false;
-            let mut is_exec = false;
-            let mut is_write = false;
-            if buf.len() >= 4 && buf[0] == b'c' && buf[1] == b'a' && buf[2] == b't' && buf[3] == b' ' {
-                is_cat = true;
-            }
-            if buf.len() >= 5 && buf[0] == b'e' && buf[1] == b'x' && buf[2] == b'e' && buf[3] == b'c' && buf[4] == b' ' {
-                is_exec = true;
-            }
-            let mut is_rm = false;
-            let mut is_rmdir = false;
-            let mut is_mkdir = false;
-            if buf.len() >= 3 && buf[0] == b'r' && buf[1] == b'm' && buf[2] == b' ' {
-                is_rm = true;
-            }
-            if buf.len() >= 6 && buf[0] == b'r' && buf[1] == b'm' && buf[2] == b'd' && buf[3] == b'i' && buf[4] == b'r' && buf[5] == b' ' {
-                is_rmdir = true;
-            }
-            if buf.len() >= 6 && buf[0] == b'm' && buf[1] == b'k' && buf[2] == b'd' && buf[3] == b'i' && buf[4] == b'r' && buf[5] == b' ' {
-                is_mkdir = true;
-            }
-            if buf.len() >= 6 && buf[0] == b'w' && buf[1] == b'r' && buf[2] == b'i' && buf[3] == b't' && buf[4] == b'e' && buf[5] == b' ' {
-                is_write = true;
-            }
-            if is_rmdir {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 { fs::rmdir(arg); }
-                else { w("Usage: rmdir PATH\r\n"); }
-            } else if is_rm {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 { fs::rm(arg); }
-                else { w("Usage: rm PATH\r\n"); }
-            } else if is_mkdir {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 { fs::mkdir(arg); }
-                else { w("Usage: mkdir PATH\r\n"); }
-            } else if is_write {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 {
-                    // Extract content after the path
-                    let mut i = 0;
-                    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
-                    while buf[i] == b' ' { i += 1; }
-                    while buf[i] != 0 && buf[i] != b' ' { i += 1; }
-                    while buf[i] == b' ' { i += 1; }
-                    let content = if buf[i] != 0 { &buf[i..] } else { &[] };
-                    // Find the null terminator
-                    let content_len = content.iter().position(|&c| c == 0).unwrap_or(content.len());
-                    fs::write_file(arg, &content[..content_len]);
-                } else { w("Usage: write PATH TEXT\r\n"); }
-            } else if is_cat {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 { fs::cat_path(arg); }
-                else { w("Usage: cat PATH\r\n"); }
-            } else if is_exec {
-                let arg = parse_arg(&buf);
-                if arg.len() > 0 { crate::elf::load_and_spawn(arg); }
-                else { w("Usage: exec PATH\r\n"); }
-            } else {
-                w("Unknown command\r\n");
-            }
+            w("Unknown command: ");
+            let s = core::str::from_utf8(cmd).unwrap_or("?");
+            w(s);
+            w("\r\nType 'help' for available commands.\r\n");
         }
     }
 }

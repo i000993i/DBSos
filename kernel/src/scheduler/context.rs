@@ -1,7 +1,7 @@
 // Context switching: timer_stub, reschedule, load_gdt_tss, yield_now
 
 use core::arch::asm;
-use super::{TaskState, STACK_SIZE, CURRENT, TASKS};
+use super::{TaskState, STACK_SIZE, STACK_CANARY, CURRENT, TASKS};
 use super::task;
 
 static mut TICK_COUNT: u64 = 0;
@@ -13,7 +13,7 @@ core::arch::global_asm!(
     "  push rbp",  "  push rsi",  "  push rdi",  "  push r8",
     "  push r9",   "  push r10",  "  push r11",  "  push r12",
     "  push r13",  "  push r14",  "  push r15",
-    "  mov rcx, 0xFEE000B0",
+    "  mov rcx, 0xFFFFFFFFFEE000B0",
     "  xor eax, eax",
     "  mov [rcx], eax",
     "  mov rcx, rsp",
@@ -30,6 +30,17 @@ core::arch::global_asm!(
 
 extern "C" { fn timer_stub(); }
 
+/// Reload the default kernel GDT (built at boot by interrupts::init).
+/// Must be called when returning to a ring-0 (non-ring3) task so the CPU stops
+/// using a (possibly freed) per-task GDT.
+pub unsafe fn load_kernel_gdt() {
+    let pd = crate::interrupts::GdtPacked {
+        limit: crate::interrupts::KERNEL_GDT_LIMIT,
+        base: crate::interrupts::KERNEL_GDT_BASE,
+    };
+    asm!("lgdt [{p}]", p = in(reg) &pd as *const _ as u64);
+}
+
 pub unsafe fn load_gdt_tss(gdt_phys: u64, tss_phys: u64, stack_top: u64) {
     let pd = crate::interrupts::GdtPacked { limit: (8*8 - 1) as u16, base: gdt_phys };
     asm!("lgdt [{p}]", p = in(reg) &pd as *const _ as u64);
@@ -42,6 +53,20 @@ pub unsafe fn load_gdt_tss(gdt_phys: u64, tss_phys: u64, stack_top: u64) {
 unsafe extern "C" fn reschedule(rsp: u64) -> u64 {
     TICK_COUNT += 1;
     let cur = CURRENT;
+
+    // Stack canary check for current task
+    if TASKS[cur].stack_base as u64 != 0 {
+        let canary = *(TASKS[cur].stack_base as *const u64);
+        if canary != STACK_CANARY {
+            crate::driver::uart::write_str("\r\n!!! STACK OVERFLOW in task ");
+            let hex = b"0123456789ABCDEF";
+            crate::driver::uart::putchar(hex[((TASKS[cur].id >> 4) & 0xF) as usize]);
+            crate::driver::uart::putchar(hex[(TASKS[cur].id & 0xF) as usize]);
+            crate::driver::uart::write_str(" — HALTED\r\n");
+            loop { core::hint::spin_loop(); }
+        }
+    }
+
     let next = task::find_ready();
     if next != cur {
         if TASKS[cur].state == TaskState::Running || TASKS[cur].state == TaskState::Ready {
@@ -61,6 +86,14 @@ unsafe extern "C" fn reschedule(rsp: u64) -> u64 {
             load_gdt_tss(n.gdt_phys, n.tss_phys, ktop);
             crate::syscall::set_sys_krsp(ktop);
             crate::syscall::set_sys_ursave(n.sys_ursave);
+        } else {
+            // Ring-0 (kernel) task: always switch to the kernel address space
+            // and kernel GDT. Without this, a kernel task would keep running on
+            // the previous user task's PML4 (stale CR3) and a freed per-task GDT,
+            // which breaks user-pointer dereferences in syscall handlers (#PF)
+            // and can produce corrupt segment selectors.
+            crate::vm::switch_to(crate::vm::KERNEL_PML4 as *mut u64);
+            load_kernel_gdt();
         }
         let next_fpu = TASKS[next].fpu_buf_phys;
         if next_fpu != 0 {

@@ -160,6 +160,12 @@ pub fn pfree(phys: u64) {
     }
 }
 
+pub fn pfree_n(phys: u64, n: usize) {
+    for i in 0..n {
+        pfree(phys + (i as u64) * (PAGE_SIZE as u64));
+    }
+}
+
 pub fn free_count() -> usize {
     unsafe { (*&raw const ALLOC).free_pages }
 }

@@ -202,6 +202,12 @@ pub unsafe fn test_ring3_console() {
 }
 
 pub unsafe fn test_ring3() {
+    // Disable interrupts for the whole ring-3 bringup. The code below switches
+    // CR3 and loads per-task GDTs (global state). A timer interrupt landing in
+    // the middle leaves the kernel executing with a mismatched CR3+GDT and can
+    // corrupt page tables (observed as clobbered user PD/PT pages). Everything
+    // is set up atomically; the LAPIC preemption resumes at the next task.
+    asm!("cli");
     crate::driver::uart::write_str("[RING3] test start\r\n");
 
     let entry_a: u64 = 0x100000000u64;
@@ -224,6 +230,37 @@ pub unsafe fn test_ring3() {
         crate::vm::PTE_WRITABLE | crate::vm::PTE_USER) != 0 { return; }
     if crate::vm::map_page(pml4_b, stack_phys_b, stack_b_virt,
         crate::vm::PTE_WRITABLE | crate::vm::PTE_USER) != 0 { return; }
+    // DEBUG B mapping
+    {
+        let v2p = unsafe { crate::vm::virt_to_phys(pml4_b, entry_b) };
+        crate::driver::uart::write_str("[B] code_phys=");
+        crate::scheduler::uart_hex(code_phys_b);
+        crate::driver::uart::write_str(" v2p@");
+        crate::scheduler::uart_hex(v2p);
+        crate::driver::uart::write_str(" pml4=");
+        crate::scheduler::uart_hex(pml4_b as u64);
+        // print level phys + first PD entries
+        unsafe {
+            let p4 = pml4_b as *const u64;
+            let e0 = *p4.add((entry_b >> 39) as usize & 0x1FF);
+            let p3 = (e0 & 0xFFFF_FFFF_F000) as *const u64;
+            let e1 = *p3.add((entry_b >> 30) as usize & 0x1FF);
+            crate::driver::uart::write_str(" PML4E=");
+            crate::scheduler::uart_hex(e0);
+            crate::driver::uart::write_str(" PDPTE=");
+            crate::scheduler::uart_hex(e1);
+            crate::driver::uart::write_str(" PDphys=");
+            crate::scheduler::uart_hex(e1 & 0xFFFF_FFFF_F000);
+            let p2 = (e1 & 0xFFFF_FFFF_F000) as *const u64;
+            for k in 0..4 {
+                crate::driver::uart::write_str(" PD[");
+                crate::driver::uart::putchar(b'0' + k as u8);
+                crate::driver::uart::write_str("]=");
+                crate::scheduler::uart_hex(*p2.add(k));
+            }
+        }
+        crate::driver::uart::write_str("\r\n");
+    }
 
     let mut pd: crate::interrupts::GdtPacked = core::mem::zeroed();
     asm!("sgdt [{}]", in(reg) (&mut pd as *mut crate::interrupts::GdtPacked) as u64);
@@ -262,6 +299,7 @@ pub unsafe fn test_ring3() {
 
     test_ring3_e1000();
     test_ring3_console();
+    asm!("sti");
 }
 
 pub use super::ring3_done;

@@ -217,7 +217,7 @@ pub fn ls() {
             let name = format_name(&buf[off..]);
             let name_slice = &name[..name.iter().position(|&c| c == 0).unwrap_or(11)];
             uart::write_str(if attr & dir_attr_dir != 0 { "  [DIR] " } else { "        " });
-            uart::write_str(unsafe { core::str::from_utf8_unchecked(name_slice) });
+            uart::write_str(core::str::from_utf8(name_slice).unwrap_or("<invalid>"));
             if attr & dir_attr_dir == 0 {
                 let sz = le_u32(&buf, off + 28);
                 uart::write_str("  ");
@@ -248,7 +248,10 @@ pub fn cat(name: &[u8]) {
     let cluster_sz = bps * spc;
     let mut remaining = file_size as u64;
     let mut cluster = first_cluster;
+    let mut iter = 0u32;
     while remaining > 0 && !is_eoc(cluster) && cluster != 0 {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return; }
         let to_read = if remaining < cluster_sz { remaining } else { cluster_sz };
         let nsecs = (to_read + bps - 1) / bps;
         let lba = cluster_to_lba(cluster);
@@ -283,7 +286,10 @@ pub fn read_file(name: &[u8], buf: &mut [u8]) -> Option<usize> {
     let mut remaining = file_size;
     let mut cluster = first_cluster;
     let mut offset = 0;
+    let mut iter = 0u32;
     while remaining > 0 && !is_eoc(cluster) && cluster != 0 {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return None; }
         let to_read = if remaining < cluster_sz as usize { remaining } else { cluster_sz as usize };
         let nsecs = (to_read + bps as usize - 1) / bps as usize;
         let lba = cluster_to_lba(cluster);
@@ -315,7 +321,10 @@ pub fn read_file_path(path: &[u8], buf: &mut [u8]) -> Option<usize> {
     let mut remaining = file_size;
     let mut cluster = first_cluster;
     let mut offset = 0;
+    let mut iter = 0u32;
     while remaining > 0 && !is_eoc(cluster) && cluster != 0 {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return None; }
         let to_read = if remaining < cluster_sz as usize { remaining } else { cluster_sz as usize };
         let nsecs = (to_read + bps as usize - 1) / bps as usize;
         let lba = cluster_to_lba(cluster);
@@ -447,7 +456,10 @@ fn resolve_name<'a>(path: &'a [u8]) -> &'a [u8] {
 }
 
 fn free_cluster_chain(mut cluster: u16) -> bool {
+    let mut iter = 0u32;
     while !is_eoc(cluster) && cluster != 0 {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return false; }
         let next = read_fat_entry(cluster);
         if !set_fat_entry(cluster, 0) { return false; }
         cluster = next;
@@ -543,7 +555,12 @@ fn extend_subdir(dir_cluster: u16) -> Option<u16> {
     let new = alloc_cluster()?;
     set_fat_entry(new, 0xFFFF);
     let mut last = dir_cluster;
-    while !is_eoc(read_fat_entry(last)) { last = read_fat_entry(last); }
+    let mut iter = 0u32;
+    while !is_eoc(read_fat_entry(last)) {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return None; }
+        last = read_fat_entry(last);
+    }
     set_fat_entry(last, new);
     Some(new)
 }
@@ -585,7 +602,10 @@ fn write_data_to_clusters(first_cluster: u16, data: &[u8]) -> bool {
     let mut remaining = data.len();
     let mut cluster = first_cluster;
     let mut offset = 0;
+    let mut iter = 0u32;
     while remaining > 0 && !is_eoc(cluster) {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return false; }
         let lba = cluster_to_lba(cluster);
         let chunk = core::cmp::min(remaining, bytes_per_cluster as usize);
         let nsecs = (chunk + 511) / 512;
@@ -628,7 +648,9 @@ pub fn write_file(path: &[u8], data: &[u8]) -> bool {
     if let Some((old_cluster, _, entry_idx, _)) = existing {
         if old_cluster != 0 { free_cluster_chain(old_cluster); }
         if data.is_empty() {
-            update_dir_entry(parent, entry_idx, 0, 0);
+            if !update_dir_entry(parent, entry_idx, 0, 0) {
+                uart::write_str("[FS] update entry failed\r\n"); return false;
+            }
             return true;
         }
         let bytes_per_cluster = spc() as u64 * bps() as u64;
@@ -644,7 +666,10 @@ pub fn write_file(path: &[u8], data: &[u8]) -> bool {
             prev = c;
         }
         if !write_data_to_clusters(first, data) { free_cluster_chain(first); return false; }
-        update_dir_entry(parent, entry_idx, first, data.len() as u32);
+        if !update_dir_entry(parent, entry_idx, first, data.len() as u32) {
+            free_cluster_chain(first);
+            uart::write_str("[FS] update entry failed\r\n"); return false;
+        }
     } else {
         if data.is_empty() {
             return add_dir_entry(parent, name, &short, 0x20, 0, 0);
@@ -662,7 +687,10 @@ pub fn write_file(path: &[u8], data: &[u8]) -> bool {
             prev = c;
         }
         if !write_data_to_clusters(first, data) { free_cluster_chain(first); return false; }
-        add_dir_entry(parent, name, &short, 0x20, first, data.len() as u32);
+        if !add_dir_entry(parent, name, &short, 0x20, first, data.len() as u32) {
+            free_cluster_chain(first);
+            uart::write_str("[FS] add entry failed\r\n"); return false;
+        }
     }
     uart::write_str("[FS] write OK\r\n");
     true
@@ -709,7 +737,7 @@ fn list_directory(dir_cluster: u16) {
             let name = format_name(&buf[off..]);
             let name_slice = &name[..name.iter().position(|&c| c == 0).unwrap_or(11)];
             uart::write_str(if attr & attr_dir != 0 { "  [DIR] " } else { "        " });
-            uart::write_str(unsafe { core::str::from_utf8_unchecked(name_slice) });
+            uart::write_str(core::str::from_utf8(name_slice).unwrap_or("<invalid>"));
             if attr & attr_dir == 0 {
                 let sz = le_u32(&buf, off + 28);
                 uart::write_str("  ");
@@ -815,7 +843,10 @@ pub fn cat_path(path: &[u8]) {
     let cluster_sz = bps_val * spc_val;
     let mut remaining = file_size as u64;
     let mut cluster = first_cluster;
+    let mut iter = 0u32;
     while remaining > 0 && !is_eoc(cluster) && cluster != 0 {
+        iter += 1;
+        if iter > 100_000 { uart::write_str("[FS] FAT chain cycle detected\r\n"); return; }
         let to_read = if remaining < cluster_sz { remaining } else { cluster_sz };
         let nsecs = (to_read + bps_val - 1) / bps_val;
         let lba = cluster_to_lba(cluster);
@@ -828,5 +859,51 @@ pub fn cat_path(path: &[u8]) {
             if remaining == 0 { break; }
         }
         if remaining > 0 { cluster = read_fat_entry(cluster); }
+    }
+}
+
+/// Check if a path is a directory (attr bit 0x10)
+pub fn is_dir(path: &[u8]) -> bool {
+    // Root is always a directory
+    if path.len() == 0 || (path.len() == 1 && path[0] == b'/') {
+        return true;
+    }
+    let parent = match resolve_dir(path) {
+        Some(p) => p,
+        None => return false,
+    };
+    let name = resolve_name(path);
+    if name.is_empty() { return true; }
+    match find_in_dir(parent, name) {
+        Some((_, _, _, attr)) => attr & 0x10 != 0,
+        None => false,
+    }
+}
+
+/// Get file size for a path. Returns None if not found or is a directory.
+pub fn file_size(path: &[u8]) -> Option<u32> {
+    if path.len() == 0 { return None; }
+    let parent = resolve_dir(path)?;
+    let name = resolve_name(path);
+    if name.is_empty() { return None; }
+    match find_in_dir(parent, name) {
+        Some((_cluster, size, _, attr)) => {
+            if attr & 0x10 != 0 { None } else { Some(size) }
+        }
+        None => None,
+    }
+}
+
+/// Find a file by full path. Returns (cluster, size) or None.
+pub fn find_file(path: &[u8]) -> Option<(u16, u32)> {
+    if path.len() == 0 { return None; }
+    let parent = resolve_dir(path)?;
+    let name = resolve_name(path);
+    if name.is_empty() { return None; }
+    match find_in_dir(parent, name) {
+        Some((cluster, size, _, attr)) => {
+            if attr & 0x10 != 0 { None } else { Some((cluster, size)) }
+        }
+        None => None,
     }
 }

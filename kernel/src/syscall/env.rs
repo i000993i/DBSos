@@ -95,6 +95,7 @@ pub unsafe fn setup_user_gdt_tss(gdt_phys: u64, tss_page: u64, tss_rsp0: u64, ts
     asm!("mov qword ptr [{base}], {val}", base = in(reg) (gdt_phys+56),  val = in(reg) tss_hi);
 }
 
+#[allow(dead_code)]
 unsafe fn setup_task_pml4(pml4: *mut u64, gdt_phys: u64, tss_page: u64, kstk: u64) {
     let orig = crate::vm::current_pml4() as *mut u64;
     crate::vm::switch_to(pml4);

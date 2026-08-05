@@ -1,3 +1,5 @@
+#![allow(static_mut_refs)]
+
 use crate::io;
 
 fn uart_print(s: &str) { crate::driver::uart::write_str(s); }

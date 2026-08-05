@@ -3,7 +3,7 @@
 use core::arch::asm;
 use crate::io;
 
-const LAPIC_BASE: u64 = 0xFEE0_0000;
+const LAPIC_BASE: u64 = 0xFFFF_FFFF_FEE0_0000;
 
 fn lapic_write(offset: u32, value: u32) {
     unsafe { io::mmio_write32((LAPIC_BASE + offset as u64) as *mut u32, value) }

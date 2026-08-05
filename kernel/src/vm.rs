@@ -194,10 +194,12 @@ pub unsafe fn current_pml4() -> u64 {
 }
 
 /// Clone kernel mappings from one address space to another.
-/// Assumes both are identity-mapped for low 4GB or share a page table skeleton.
+/// Kernel entries (256-511) are shared by reference — all processes see the same
+/// kernel page tables. This is intentional: kernel memory is read-only to user
+/// mode and mapped at boot, so no process should modify these entries.
+/// WARNING: Calling walk_or_create(create=true) on a kernel address from a
+/// non-primary address space would corrupt the shared page tables.
 pub unsafe fn clone_kernel_mappings(src_pml4: *mut u64, dst_pml4: *mut u64) {
-    // Copy PML4 entries for high half (kernel space)
-    // User entries are indices 0-255, kernel entries 256-511
     for i in 256..512 {
         let src_pte = get_pte(src_pml4, i);
         if src_pte & PTE_PRESENT != 0 {
@@ -254,31 +256,28 @@ pub unsafe fn identity_map_2mb(pml4: *mut u64, start: u64, end: u64, extra_flags
     true
 }
 
-/// Free all page table pages and mapped data pages in the low half (indices 0-255)
-/// of a user address space.
+/// Free all page-table pages (PML4/PDPT/PD/PT) of a user address space.
+/// Data pages are NOT freed here: they are owned and released separately
+/// (code_phys / user_stack_phys in scheduler::process). 2MB huge pages from
+/// prepare_user_pml4's identity map are shared kernel mappings and are left
+/// untouched — freeing them corrupts the phys allocator.
 pub unsafe fn destroy_address_space(pml4: *mut u64) {
     use crate::memory::pfree;
     for i in 0..256 {
         let e0 = get_pte(pml4, i);
         if e0 & PTE_PRESENT == 0 { continue; }
+        if e0 & PTE_HUGE != 0 { pfree(phys_from_pte(e0)); continue; }
         let pdpt = table_from_phys(phys_from_pte(e0));
         for j in 0..512 {
             let e1 = get_pte(pdpt, j);
             if e1 & PTE_PRESENT == 0 { continue; }
-            if e1 & PTE_HUGE != 0 { pfree(phys_from_pte(e1)); continue; }
+            if e1 & PTE_HUGE != 0 { continue; } // shared 1GB mapping
             let pd = table_from_phys(phys_from_pte(e1));
             for k in 0..512 {
                 let e2 = get_pte(pd, k);
                 if e2 & PTE_PRESENT == 0 { continue; }
-                if e2 & PTE_HUGE != 0 { pfree(phys_from_pte(e2)); continue; }
-                let pt = table_from_phys(phys_from_pte(e2));
-                for l in 0..512 {
-                    let e3 = get_pte(pt, l);
-                    if e3 & PTE_PRESENT != 0 {
-                        pfree(phys_from_pte(e3));
-                    }
-                }
-                pfree(phys_from_pte(e2));
+                if e2 & PTE_HUGE != 0 { continue; } // shared 2MB identity
+                pfree(phys_from_pte(e2)); // PT page
             }
             pfree(phys_from_pte(e1));
         }
@@ -291,6 +290,8 @@ pub unsafe fn destroy_address_space(pml4: *mut u64) {
 pub static mut KERNEL_PML4: u64 = 0;
 
 /// Initialize virtual memory: set up kernel's address space.
+pub const LAPIC_HH_VIRT: u64 = 0xFFFF_FFFF_FEE0_0000;
+
 pub unsafe fn init() {
     let phys = current_pml4();
     KERNEL_PML4 = phys;
@@ -298,8 +299,28 @@ pub unsafe fn init() {
     uart_hex(phys);
     uart_print("\r\n");
 
-    // Ensure kernel can access high-half mappings later
-    // For now, we work with identity-mapped page tables (as set up by firmware)
+    // Disable WP so map_page can write to page table pages that UEFI may have read-only
+    {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1u64 << 16);
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+    }
+
+    // Map LAPIC at upper-half canonical address so it's cloned with kernel mappings
+    // into every task's address space. timer_stub writes EOI there on IRQ.
+    map_page(phys as *mut u64, 0xFEE00000, LAPIC_HH_VIRT, PTE_WRITABLE | PTE_CACHE_DISABLE);
+    // Also keep identity mapping for early code that uses the low address
+    map_page(phys as *mut u64, 0xFEE00000, 0xFEE00000, PTE_WRITABLE | PTE_CACHE_DISABLE);
+    uart_print("[VM] LAPIC mapped\r\n");
+
+    // Re-enable WP
+    {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1u64 << 16;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+    }
 }
 
 fn uart_print(s: &str) {
