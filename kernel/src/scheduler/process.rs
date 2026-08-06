@@ -105,6 +105,8 @@ pub fn init() {
             code_phys: 0, user_stack_phys: 0, kstack_phys: 0, fpu_buf_phys: 0,
             pending_msg: Message::empty(),
             fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
+            vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
+            vma_count: 0,
         };
     }
 }

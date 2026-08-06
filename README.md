@@ -101,6 +101,7 @@ qemu-system-x86_64 \
 - **Capability-based** — доступ к ресурсам через capabilities
 - **no_std** — ядро без стандартной библиотеки
 - **Preemptive** — вытесняющая многозадачность (LAPIC timer ~100 Hz)
+- **Demand paging** — куча/стек процессов мапятся по требованию через VMA
 - **ELF loading** — пользовательские бинарники из FAT-файловой системы
 
 ---
@@ -141,12 +142,12 @@ qemu-system-x86_64 \
 | ACPI (reboot/shutdown) | ✅ | Ring 3 Tasks | ✅ |
 | HPET Timer | ✅ | Display (GOP) | ✅ |
 | Interactive Shell (15+ cmds) | ✅ | PCI Bus | ✅ |
+| Demand Paging (VMA) | ✅ | IRQ-safe Allocator | ✅ |
 
 ### В доработке
 
 | Компонент | Приоритет |
 |-----------|-----------|
-| Page Fault Handler | Высокий |
 | TCP/IP Stack | Высокий |
 | FS Server (Ring 3) | Средний |
 | DHCP / DNS | Средний |

@@ -158,6 +158,10 @@ pub fn init() {
 
     unsafe { syscall::init(); }
 
+    // Re-apply e1000 DMA rings + TX/RX config post-EBS (pre-EBS register
+    // writes can be lost to the CPU cache / MMIO write-back mapping).
+    driver::net::reinit_after_ebs();
+
     // Test NIC TX after EBS
     driver::net::tx_test();
 

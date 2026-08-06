@@ -7,6 +7,7 @@ const ENTRY_A: u64 = 0x100000000;
 const ENTRY_B: u64 = 0x100001000;
 const ENTRY_E1000: u64 = 0x100002000;
 const ENTRY_CONSOLE: u64 = 0x100003000;
+const ENTRY_DEMAND: u64 = 0x100004000;
 const MMIO_VIRT: u64 = 0x30000000;
 const E1000_BDF: u64 = 0x0010;
 const E1000_BAR0_OFF: u64 = 0x10;
@@ -201,6 +202,145 @@ pub unsafe fn test_ring3_console() {
     }
 }
 
+/// Emit ring-3 code that exercises demand paging:
+///  * lazy heap at 0x300000000 — 16 pages, none mapped up front
+///  * stack growth from 0x200103000 down to 0x200100000 (3 pages below the
+///    single initially-mapped stack page)
+/// Every page crossing faults once; the kernel maps a zeroed page and retries.
+/// On success prints "[DM] heap+stack demand paging OK" and exits.
+pub unsafe fn write_user_code_demand(dst: *mut u8) {
+    use super::emit::*;
+    let ok_str = b"[DM] heap+stack demand paging OK\r\n";
+    let fail_str = b"[DM] VERIFY FAIL\r\n";
+    let ok_off: usize = 0x200;
+    let fail_off: usize = 0x240;
+    let mut p: usize = 0;
+
+    // --- lazy heap: write marker to every 8 bytes across 16 pages ---
+    p += emit_mov_imm64(dst, p, 2, 0x300000000u64);        // rdx = heap base
+    p += emit_mov_imm64(dst, p, 8, 0x300100000u64);        // r8  = heap end
+    p += emit_mov_imm64(dst, p, 1, 0x1111u64);             // rcx = marker
+    let hloop = p;
+    dst.add(p).write(0x48); dst.add(p+1).write(0x89); dst.add(p+2).write(0x0A); p += 3; // mov [rdx], rcx
+    dst.add(p).write(0x48); dst.add(p+1).write(0x83); dst.add(p+2).write(0xC2); dst.add(p+3).write(0x08); p += 4; // add rdx, 8
+    dst.add(p).write(0x4C); dst.add(p+1).write(0x39); dst.add(p+2).write(0xC2); p += 3; // cmp rdx, r8
+    let j_h = p; dst.add(p).write(0x75); dst.add(p+1).write(0x00); p += 2; // jne hloop
+    dst.add(j_h+1).write((hloop as i64 - (j_h as i64 + 2)) as u8);
+
+    // --- verify first heap page ---
+    p += emit_mov_imm64(dst, p, 2, 0x300000000u64);
+    dst.add(p).write(0x48); dst.add(p+1).write(0x8B); dst.add(p+2).write(0x0A); p += 3; // mov rcx, [rdx]
+    p += emit_mov_imm32(dst, p, 0, 0x1111);                 // rax = 0x1111
+    dst.add(p).write(0x48); dst.add(p+1).write(0x39); dst.add(p+2).write(0xC1); p += 3; // cmp rcx, rax
+    let j_hv = p; dst.add(p).write(0x75); dst.add(p+1).write(0x00); p += 2; // jne fail (patched below)
+
+    // --- verify last heap page ---
+    p += emit_mov_imm64(dst, p, 2, 0x3000FF000u64);
+    dst.add(p).write(0x48); dst.add(p+1).write(0x8B); dst.add(p+2).write(0x0A); p += 3;
+    dst.add(p).write(0x48); dst.add(p+1).write(0x39); dst.add(p+2).write(0xC1); p += 3; // cmp rcx, rax
+    let j_hv2 = p; dst.add(p).write(0x75); dst.add(p+1).write(0x00); p += 2;
+
+    // --- stack growth: walk 0x200103000 down to 0x200100000 ---
+    p += emit_mov_imm64(dst, p, 2, 0x200103000u64);
+    p += emit_mov_imm64(dst, p, 8, 0x200100000u64);
+    let sloop = p;
+    dst.add(p).write(0x48); dst.add(p+1).write(0x83); dst.add(p+2).write(0xEA); dst.add(p+3).write(0x08); p += 4; // sub rdx, 8
+    dst.add(p).write(0x48); dst.add(p+1).write(0x89); dst.add(p+2).write(0x12); p += 3; // mov [rdx], rdx
+    dst.add(p).write(0x4C); dst.add(p+1).write(0x39); dst.add(p+2).write(0xC2); p += 3; // cmp rdx, r8
+    let j_s = p; dst.add(p).write(0x75); dst.add(p+1).write(0x00); p += 2; // jne sloop
+    dst.add(j_s+1).write((sloop as i64 - (j_s as i64 + 2)) as u8);
+
+    // --- verify stack bottom page (marker == address) ---
+    p += emit_mov_imm64(dst, p, 2, 0x200100000u64);
+    dst.add(p).write(0x48); dst.add(p+1).write(0x8B); dst.add(p+2).write(0x0A); p += 3; // mov rcx, [rdx]
+    p += emit_mov_imm64(dst, p, 0, 0x200100000u64);        // rax = expected marker
+    dst.add(p).write(0x48); dst.add(p+1).write(0x39); dst.add(p+2).write(0xC1); p += 3; // cmp rcx, rax
+    let j_sv = p; dst.add(p).write(0x75); dst.add(p+1).write(0x00); p += 2;
+
+    // --- success path (fall-through): print OK, then exit ---
+    for (i, &b) in ok_str.iter().enumerate() { dst.add(ok_off + i).write(b); }
+    p += emit_print(dst, p, ENTRY_DEMAND + ok_off as u64, ok_str.len() as u32);
+    p += emit_mov_imm32(dst, p, 0, 0);                      // SYS_EXIT
+    p += emit_syscall(dst, p);
+    dst.add(p).write(0xEB); dst.add(p+1).write(0xFE); p += 2; // jmp $ (unreachable)
+
+    // --- fail path ---
+    let fail = p;
+    for (i, &b) in fail_str.iter().enumerate() { dst.add(fail_off + i).write(b); }
+    p += emit_print(dst, p, ENTRY_DEMAND + fail_off as u64, fail_str.len() as u32);
+    dst.add(p).write(0xEB); dst.add(p+1).write(0xFE);
+
+    // Patch forward jne targets to the fail label.
+    dst.add(j_hv+1).write((fail as i64 - (j_hv as i64 + 2)) as u8);
+    dst.add(j_hv2+1).write((fail as i64 - (j_hv2 as i64 + 2)) as u8);
+    dst.add(j_sv+1).write((fail as i64 - (j_sv as i64 + 2)) as u8);
+}
+
+pub unsafe fn test_ring3_demand() {
+    crate::driver::uart::write_str("[DM] demand paging test...\r\n");
+
+    let entry = ENTRY_DEMAND;
+    let stack_virt: u64 = 0x200103000;
+    let stack_top = stack_virt + 4096;
+    let stack_low: u64 = 0x200100000;
+    let heap_virt: u64 = 0x300000000;
+    let heap_end: u64 = 0x300100000;
+
+    let code_phys = match crate::memory::palloc() { 0 => return, v => v };
+    let stack_phys = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); return } v => v };
+    let gdt_phys = match crate::memory::palloc() { 0 => return, v => v };
+    let tss_page = match crate::memory::palloc() { 0 => return, v => v };
+    let pml4 = match prepare_user_pml4() { Some(v) => v, None => return };
+
+    write_user_code_demand(code_phys as *mut u8);
+
+    if crate::vm::map_page(pml4, code_phys, entry,
+        crate::vm::PTE_WRITABLE | crate::vm::PTE_USER) != 0 { return; }
+    // Map only the initial stack page; the pages below are demand-paged.
+    if crate::vm::map_page(pml4, stack_phys, stack_virt,
+        crate::vm::PTE_WRITABLE | crate::vm::PTE_USER) != 0 { return; }
+
+    // Bring up GDT/TSS with interrupts masked so VMAs can be registered
+    // atomically before the task can ever be scheduled.
+    asm!("cli");
+    let orig = crate::vm::current_pml4() as *mut u64;
+    crate::vm::switch_to(pml4);
+    let sys_krsp_val = core::ptr::addr_of!(super::sys_krsp).read();
+    setup_user_gdt_tss(gdt_phys, tss_page, sys_krsp_val, false);
+    asm!("lgdt [{ptr}]", ptr = in(reg) &crate::interrupts::GdtPacked {
+        limit: (8*8-1) as u16, base: gdt_phys } as *const _ as u64);
+    crate::vm::switch_to(orig);
+
+    super::sys_kret = super::ring3_done as *const () as u64;
+    let id = crate::scheduler::spawn_user(entry, stack_top, pml4, gdt_phys, tss_page, code_phys, stack_phys);
+    let hex = b"0123456789ABCDEF";
+    if let Some(tid) = id {
+        crate::driver::uart::write_str("[DM] spawned id=");
+        crate::driver::uart::putchar(hex[(tid >> 4) as usize]);
+        crate::driver::uart::putchar(hex[(tid & 0xF) as usize]);
+        if let Some(slot) = crate::scheduler::find_task(tid) {
+            crate::driver::uart::write_str(" slot=");
+            crate::driver::uart::putchar(hex[(slot >> 4) as usize]);
+            crate::driver::uart::putchar(hex[(slot & 0xF) as usize]);
+            let ok1 = crate::scheduler::vma::add(slot, stack_low, stack_top,
+                crate::scheduler::vma::VMA_STACK,
+                crate::vm::PTE_WRITABLE | crate::vm::PTE_USER);
+            let ok2 = crate::scheduler::vma::add(slot, heap_virt, heap_end,
+                crate::scheduler::vma::VMA_HEAP,
+                crate::vm::PTE_WRITABLE | crate::vm::PTE_USER);
+            crate::driver::uart::write_str(" vma=");
+            crate::driver::uart::putchar(if ok1 { b'1' } else { b'0' });
+            crate::driver::uart::putchar(if ok2 { b'1' } else { b'0' });
+        } else {
+            crate::driver::uart::write_str(" find=NONE");
+        }
+        crate::driver::uart::write_str("\r\n");
+    } else {
+        crate::driver::uart::write_str("[DM] spawn FAILED\r\n");
+    }
+    asm!("sti");
+}
+
 pub unsafe fn test_ring3() {
     // Disable interrupts for the whole ring-3 bringup. The code below switches
     // CR3 and loads per-task GDTs (global state). A timer interrupt landing in
@@ -299,6 +439,7 @@ pub unsafe fn test_ring3() {
 
     test_ring3_e1000();
     test_ring3_console();
+    test_ring3_demand();
     asm!("sti");
 }
 

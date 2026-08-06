@@ -4,6 +4,7 @@ pub mod context;
 pub mod lapic;
 pub mod task;
 pub mod spawn;
+pub mod vma;
 pub mod ipc_sched;
 pub mod process;
 pub mod tests;
@@ -82,6 +83,8 @@ pub struct Task {
     pub fpu_buf_phys: u64,
     pub pending_msg: Message,
     pub fds: [FdEntry; MAX_FDS],
+    pub vmas: [vma::Vma; vma::MAX_VMAS],
+    pub vma_count: u8,
 }
 
 impl Task {
@@ -96,6 +99,8 @@ impl Task {
             code_phys: 0, user_stack_phys: 0, kstack_phys: 0, fpu_buf_phys: 0,
             pending_msg: Message::empty(),
             fds: [const { FdEntry::empty() }; MAX_FDS],
+            vmas: [const { vma::Vma::empty() }; vma::MAX_VMAS],
+            vma_count: 0,
         }
     }
 }

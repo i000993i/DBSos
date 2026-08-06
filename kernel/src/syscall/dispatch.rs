@@ -413,6 +413,8 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                     fpu_buf_phys: crate::scheduler::task::fpu_alloc_buf(),
                     pending_msg: Message::empty(),
                     fds: new_fds,
+                    vmas: [const { crate::scheduler::vma::Vma::empty() }; crate::scheduler::vma::MAX_VMAS],
+                    vma_count: 0,
                 };
 
                 // Copy FPU state

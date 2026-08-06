@@ -71,12 +71,27 @@ unsafe fn alloc_mut() -> &'static mut PhysAllocator {
     &mut *(&raw mut ALLOC)
 }
 
-pub fn palloc() -> u64 {
+/// Run `f` with interrupts disabled, then restore the previous IF state.
+/// Unlike a bare `cli`/`sti` pair, this does NOT re-enable interrupts if the
+/// caller already had them masked (which would break outer critical sections).
+fn with_irqs_off<T>(f: impl FnOnce() -> T) -> T {
     unsafe {
+        let flags: u64;
+        core::arch::asm!("pushfq; pop {}", out(reg) flags);
         core::arch::asm!("cli");
+        let r = f();
+        if flags & (1 << 9) != 0 {
+            core::arch::asm!("sti");
+        }
+        r
+    }
+}
+
+pub fn palloc() -> u64 {
+    with_irqs_off(|| {
+        unsafe {
         let a = alloc_mut();
         if a.free_pages == 0 || a.bitmap_addr.is_null() {
-            core::arch::asm!("sti");
             return 0;
         }
         for i in a.first_page..a.total_pages {
@@ -84,7 +99,6 @@ pub fn palloc() -> u64 {
                 bit_set(a.bitmap_addr, i, 1);
                 a.free_pages -= 1;
                 a.first_page = i + 1;
-                core::arch::asm!("sti");
                 return a.phys_start + (i as u64) * (PAGE_SIZE as u64);
             }
         }
@@ -92,21 +106,19 @@ pub fn palloc() -> u64 {
             if bit_test(a.bitmap_addr, i) == 0 {
                 bit_set(a.bitmap_addr, i, 1);
                 a.free_pages -= 1;
-                core::arch::asm!("sti");
                 return a.phys_start + (i as u64) * (PAGE_SIZE as u64);
             }
         }
-        core::arch::asm!("sti");
         0
-    }
+        }
+    })
 }
 
 pub fn palloc_n(n: usize) -> u64 {
-    unsafe {
-        core::arch::asm!("cli");
+    with_irqs_off(|| {
+        unsafe {
         let a = alloc_mut();
         if a.free_pages < n || a.bitmap_addr.is_null() {
-            core::arch::asm!("sti");
             return 0;
         }
         let mut run_start = a.first_page;
@@ -122,33 +134,30 @@ pub fn palloc_n(n: usize) -> u64 {
                     }
                     a.free_pages -= n;
                     a.first_page = run_start + n;
-                    core::arch::asm!("sti");
                     return a.phys_start + (run_start as u64) * (PAGE_SIZE as u64);
                 }
             } else {
                 run_len = 0;
             }
         }
-        core::arch::asm!("sti");
         0
-    }
+        }
+    })
 }
 
 pub fn pfree(phys: u64) {
-    unsafe {
-        core::arch::asm!("cli");
+    with_irqs_off(|| {
+        unsafe {
         let a = alloc_mut();
         let offset = match phys.checked_sub(a.phys_start) {
             Some(o) => o,
-            None => { core::arch::asm!("sti"); return; }
+            None => { return; }
         };
         let page = (offset / (PAGE_SIZE as u64)) as usize;
         if page >= a.total_pages || a.bitmap_addr.is_null() {
-            core::arch::asm!("sti");
             return;
         }
         if bit_test(a.bitmap_addr, page) == 0 {
-            core::arch::asm!("sti");
             return;
         }
         bit_set(a.bitmap_addr, page, 0);
@@ -156,8 +165,8 @@ pub fn pfree(phys: u64) {
         if page < a.first_page {
             a.first_page = page;
         }
-        core::arch::asm!("sti");
-    }
+        }
+    })
 }
 
 pub fn pfree_n(phys: u64, n: usize) {

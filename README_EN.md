@@ -101,6 +101,7 @@ qemu-system-x86_64 \
 - **Capability-based** — resource access through capabilities
 - **no_std** — no Rust standard library
 - **Preemptive** — multitasking via LAPIC timer (~100 Hz)
+- **Demand paging** — process heap/stack mapped on demand via VMAs
 - **ELF loading** — user binaries from FAT filesystem
 
 ---
@@ -141,12 +142,12 @@ qemu-system-x86_64 \
 | ACPI (reboot/shutdown) | ✅ | Ring 3 Tasks | ✅ |
 | HPET Timer | ✅ | Display (GOP) | ✅ |
 | Interactive Shell (15+ cmds) | ✅ | PCI Bus | ✅ |
+| Demand Paging (VMA) | ✅ | IRQ-safe Allocator | ✅ |
 
 ### In Progress
 
 | Component | Priority |
 |-----------|----------|
-| Page Fault Handler | High |
 | TCP/IP Stack | High |
 | FS Server (Ring 3) | Medium |
 | DHCP / DNS | Medium |

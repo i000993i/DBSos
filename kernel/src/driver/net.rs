@@ -127,6 +127,13 @@ fn find_nic() -> bool {
 /// 0 after a wbinvd). Handles 4KB and 2MB (and 1GB) huge leaf entries.
 fn make_mmio_uncacheable(base: u64, size: u64) {
     unsafe {
+        // UEFI keeps its page-table pages mapped read-only, so we must
+        // disable WP (CR0 bit 16) to edit PTEs; re-enable it afterwards.
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 &= !(1u64 << 16);
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3);
         let pml4 = cr3 as *mut u64;
@@ -170,6 +177,15 @@ fn make_mmio_uncacheable(base: u64, size: u64) {
             core::arch::asm!("invlpg [{}]", in(reg) phys, options(nostack, preserves_flags));
             phys += 0x1000;
         }
+
+        // Changing the memory type from WB to UC requires flushing stale
+        // write-back cache lines for the region, or old lines keep buffering
+        // writes that never reach the device.
+        core::arch::asm!("wbinvd");
+
+        core::arch::asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1u64 << 16;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
     }
 }
 
@@ -508,6 +524,29 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> bool {
 
 pub fn mac() -> [u8; 6] {
     unsafe { OUR_MAC }
+}
+
+/// Re-apply DMA ring + RX/TX configuration after ExitBootServices.
+/// Register writes performed before EBS can be swallowed by the CPU cache
+/// (UEFI maps PCI MMIO write-back), so we re-issue them post-EBS with the
+/// region already marked uncacheable.
+pub fn reinit_after_ebs() {
+    unsafe {
+        make_mmio_uncacheable(MMIO, 128 * 1024);
+        dma_rings_configure();
+        enable_rx();
+        mmio_write32(REG_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
+        mmio_write32(REG_TIPG, 0x0060200A);
+        uart::write_str("[NET] post-EBS reinit: TDBAL=0x");
+        uart_hex(mmio_read32(REG_TDBAL) as u64);
+        uart::write_str(" TDLEN=0x");
+        uart_hex(mmio_read32(REG_TDLEN) as u64);
+        uart::write_str(" TCTL=0x");
+        uart_hex(mmio_read32(REG_TCTL) as u64);
+        uart::write_str(" RCTL=0x");
+        uart_hex(mmio_read32(REG_RCTL) as u64);
+        uart::write_str("\r\n");
+    }
 }
 
 pub fn dump_rx_state() {

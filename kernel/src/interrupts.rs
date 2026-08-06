@@ -110,7 +110,6 @@ core::arch::global_asm!(
     "  mov [rsp + 32], rax",    // 5th arg at the top of shadow space
     "  call default_handler_rust",
     "  add rsp, 40",
-    "  add rsp, 16",
     "  pop r15",
     "  pop r14",
     "  pop r13",
@@ -126,6 +125,7 @@ core::arch::global_asm!(
     "  pop rdx",
     "  pop rcx",
     "  pop rax",
+    "  add rsp, 16", // skip vec + error_code; iretq consumes RIP/CS/RFLAGS[/SS/RSP]
     "  iretq",
 );
 
@@ -216,6 +216,41 @@ fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: 
         // authoritative signal of which privilege level performed the access.
         let user = error_code & 4 != 0;
         let present = error_code & 1 != 0;
+
+        // Demand paging: a not-present USER fault inside a registered VMA is
+        // serviced by allocating a zeroed page and mapping it; returning from
+        // the handler makes the exception stub iretq retry the faulting
+        // instruction.  Successfully serviced faults return silently — the
+        // verbose header + page-table walk below only run for genuinely
+        // unhandled faults.
+        if user && !present {
+            unsafe {
+            let cur = crate::scheduler::CURRENT;
+            if let Some(vma) = crate::scheduler::vma::find(cur, cr2) {
+                if vma.kind == crate::scheduler::vma::VMA_STACK
+                    || vma.kind == crate::scheduler::vma::VMA_HEAP
+                    || vma.kind == crate::scheduler::vma::VMA_DATA
+                {
+                    let page = crate::memory::palloc();
+                    if page != 0 {
+                        core::ptr::write_bytes(page as *mut u8, 0, 4096);
+                        let vaddr = cr2 & !0xFFFu64;
+                        let r = crate::vm::map_page(
+                            crate::scheduler::TASKS[cur].pml4,
+                            page, vaddr,
+                            vma.flags,
+                        );
+                        if r == 0 {
+                            return;
+                        }
+                    }
+                    crate::driver::uart::write_str("\r\n  -> demand-map FAILED (OOM) at 0x");
+                    hex64(cr2 & !0xFFFu64);
+                    crate::driver::uart::write_str("\r\n");
+                }
+            }
+            }
+        }
 
         crate::driver::uart::write_str("\r\n!!! #PF vec=14 ec=");
         hex32(error_code as u32);
@@ -335,7 +370,25 @@ fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: 
         // A supervisor-access fault (US bit clear) is a kernel bug (e.g. wrong
         // CR3 while reading user memory): do NOT kill a task for it — halt.
         if user {
-            crate::driver::uart::write_str("  -> user-mode #PF, terminating process\r\n");
+            crate::driver::uart::write_str("  -> user-mode #PF, terminating process");
+            unsafe {
+                let hex = b"0123456789ABCDEF";
+                let cur = crate::scheduler::CURRENT;
+                let t = &crate::scheduler::TASKS[cur];
+                crate::driver::uart::write_str(" (vma_count=");
+                crate::driver::uart::putchar(hex[(t.vma_count & 0xF) as usize]);
+                for i in 0..t.vma_count as usize {
+                    crate::driver::uart::write_str(" v[");
+                    crate::driver::uart::putchar(hex[(i & 0xF) as usize]);
+                    crate::driver::uart::write_str("]=");
+                    hex64(t.vmas[i].start);
+                    crate::driver::uart::write_str("-");
+                    hex64(t.vmas[i].end);
+                    crate::driver::uart::write_str("k=");
+                    crate::driver::uart::putchar(hex[(t.vmas[i].kind & 0xF) as usize]);
+                }
+                crate::driver::uart::write_str(")\r\n");
+            }
             crate::scheduler::exit();
         } else {
             crate::driver::uart::write_str("  -> KERNEL #PF (supervisor access), HALTED\r\n");

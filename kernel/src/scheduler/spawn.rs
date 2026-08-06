@@ -54,6 +54,8 @@ pub fn spawn(entry: extern "C" fn()) -> Option<u64> {
             code_phys: 0, user_stack_phys: 0, kstack_phys: stack, fpu_buf_phys: task::fpu_alloc_buf(),
             pending_msg: Message::empty(),
             fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
+            vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
+            vma_count: 0,
         };
         Some(id)
     }
@@ -109,6 +111,8 @@ pub unsafe fn spawn_user(entry: u64, user_rsp: u64,
         code_phys, user_stack_phys, kstack_phys: kstack, fpu_buf_phys: fpu_buf,
         pending_msg: Message::empty(),
         fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
+        vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
+        vma_count: 0,
     };
     Some(id)
 }
