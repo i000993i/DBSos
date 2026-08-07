@@ -3,7 +3,7 @@ use crate::driver::uart;
 use crate::driver::net;
 use crate::driver::tcp;
 use crate::driver::nvme;
-use crate::fs;
+use crate::fs_server;
 use crate::memory;
 use crate::timer;
 
@@ -193,7 +193,7 @@ fn cmd_cd(arg: &[u8]) {
     resolved[rpos] = 0;
 
     // Verify the directory exists
-    if fs::is_dir(&resolved[..rpos]) {
+    if fs_server::is_dir(&resolved[..rpos]) {
         cwd_set(&resolved[..rpos]);
     } else {
         w("cd: not a directory: ");
@@ -524,19 +524,19 @@ pub fn run() {
         else if cmd == b"cd" { cmd_cd(arg); }
         else if cmd == b"echo" { cmd_echo(arg); }
         else if cmd == b"ls" {
-            if arg.len() > 0 { fs::ls_path(arg); } else { fs::ls(); }
+            if arg.len() > 0 { fs_server::ls(arg); } else { fs_server::ls(b"/"); }
         }
         else if cmd == b"cat" {
-            if arg.len() > 0 { fs::cat_path(arg); } else { w("Usage: cat PATH\r\n"); }
+            if arg.len() > 0 { fs_server::cat(arg); } else { w("Usage: cat PATH\r\n"); }
         }
         else if cmd == b"mkdir" {
-            if arg.len() > 0 { fs::mkdir(arg); } else { w("Usage: mkdir PATH\r\n"); }
+            if arg.len() > 0 { fs_server::mkdir(arg); } else { w("Usage: mkdir PATH\r\n"); }
         }
         else if cmd == b"rm" {
-            if arg.len() > 0 { fs::rm(arg); } else { w("Usage: rm PATH\r\n"); }
+            if arg.len() > 0 { fs_server::rm(arg); } else { w("Usage: rm PATH\r\n"); }
         }
         else if cmd == b"rmdir" {
-            if arg.len() > 0 { fs::rmdir(arg); } else { w("Usage: rmdir PATH\r\n"); }
+            if arg.len() > 0 { fs_server::rmdir(arg); } else { w("Usage: rmdir PATH\r\n"); }
         }
         else if cmd == b"write" {
             if arg.len() > 0 {
@@ -547,7 +547,7 @@ pub fn run() {
                         let path = &arg[..s];
                         let content = &arg[s + 1..];
                         let content_len = content.iter().position(|&c| c == 0).unwrap_or(content.len());
-                        fs::write_file(path, &content[..content_len]);
+                        fs_server::write(path, &content[..content_len]);
                     }
                     None => { w("Usage: write PATH TEXT\r\n"); }
                 }

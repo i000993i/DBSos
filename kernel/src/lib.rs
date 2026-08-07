@@ -4,6 +4,7 @@ pub mod cap;
 pub mod display;
 pub mod driver;
 pub mod fs;
+pub mod fs_server;
 pub mod interrupts;
 pub mod io;
 pub mod ipc;
@@ -205,6 +206,13 @@ pub fn init() {
     ipc::tests::run_test();
     // Shared memory zero-copy test
     ipc::shmem_test();
+    // FS server: файловая система как IP-level server
+    if crate::fs_server::init().is_some() {
+        uart_print("[FSS] client cap OK\r\n");
+        crate::fs_server::roundtrip_test();
+    } else {
+        uart_print("[FSS] init FAIL\r\n");
+    }
     scheduler::test();
 
     // Enable preemptive multitasking (LAPIC timer)

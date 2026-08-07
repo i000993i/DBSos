@@ -39,10 +39,11 @@ pub fn test() {
 
 const NUM_WORKERS: usize = 4;
 static mut COUNTERS: [u64; NUM_WORKERS] = [0; NUM_WORKERS];
-extern "C" fn worker0() { loop { unsafe { COUNTERS[0] += 1; } } }
-extern "C" fn worker1() { loop { unsafe { COUNTERS[1] += 1; } } }
-extern "C" fn worker2() { loop { unsafe { COUNTERS[2] += 1; } } }
-extern "C" fn worker3() { loop { unsafe { COUNTERS[3] += 1; } } }
+static mut WORKERS_STOP: bool = false;
+extern "C" fn worker0() { loop { if unsafe { WORKERS_STOP } { super::process::exit(); } unsafe { COUNTERS[0] += 1; } } }
+extern "C" fn worker1() { loop { if unsafe { WORKERS_STOP } { super::process::exit(); } unsafe { COUNTERS[1] += 1; } } }
+extern "C" fn worker2() { loop { if unsafe { WORKERS_STOP } { super::process::exit(); } unsafe { COUNTERS[2] += 1; } } }
+extern "C" fn worker3() { loop { if unsafe { WORKERS_STOP } { super::process::exit(); } unsafe { COUNTERS[3] += 1; } } }
 
 pub fn preempt_test() {
     crate::driver::uart::write_str("\r\n=== Preemption test ===\r\n");
@@ -67,5 +68,6 @@ pub fn preempt_test() {
             crate::driver::uart::write_str(" iterations\r\n");
         }
     }
+    unsafe { WORKERS_STOP = true; }
     crate::driver::uart::write_str("=== Preemption done ===\r\n");
 }

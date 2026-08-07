@@ -18,6 +18,9 @@ pub unsafe fn write_user_code_sender(dst: *mut u8) {
     let msg: &[u8] = b"[A] ring3 sender!\r\n";
     let str_off: usize = 0x40;
     off += emit_print(dst, off, ENTRY_A + str_off as u64, msg.len() as u32);
+    // Exit cleanly instead of spinning forever (would hog the scheduler).
+    off += emit_mov_imm32(dst, off, 0, 0); // SYS_EXIT
+    off += emit_syscall(dst, off);
     dst.add(off).write(0xEB); dst.add(off+1).write(0xFE);
     for i in 0..msg.len() { dst.add(str_off + i).write(msg[i]); }
 }
@@ -28,6 +31,9 @@ pub unsafe fn write_user_code_receiver(dst: *mut u8) {
     let msg: &[u8] = b"[B] ring3 receiver!\r\n";
     let str_off: usize = 0x40;
     off += emit_print(dst, off, ENTRY_B + str_off as u64, msg.len() as u32);
+    // Exit in-memory instead of spinning forever.
+    off += emit_mov_imm32(dst, off, 0, 0); // SYS_EXIT
+    off += emit_syscall(dst, off);
     dst.add(off).write(0xEB); dst.add(off+1).write(0xFE);
     for i in 0..msg.len() { dst.add(str_off + i).write(msg[i]); }
 }
@@ -60,6 +66,10 @@ pub unsafe fn write_user_code_e1000(dst: *mut u8) {
     let str_off: usize = 0x100;
     for i in 0..ok_str.len() { dst.add(str_off + i).write(ok_str[i]); }
     p += emit_print(dst, p, ENTRY_E1000 + str_off as u64, ok_str.len() as u32);
+
+    // Exit cleanly instead of spinning forever.
+    p += emit_mov_imm32(dst, p, 0, 0); // SYS_EXIT
+    p += emit_syscall(dst, p);
 
     dst.add(p).write(0xEB); dst.add(p+1).write(0xFE);
 }

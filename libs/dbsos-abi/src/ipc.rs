@@ -24,8 +24,29 @@ pub enum MsgType {
     DataSend = 0x0100,
     DataRecv = 0x0101,
     IrqNotification = 0x0200,
+    /// Файловая система: запрос клиента -> серверу
+    FsRequest = 0x0300,
+    /// Файловая система: ответ сервера -> клиенту
+    FsReply = 0x0301,
     Shutdown = 0xFFFF,
 }
+
+// ── FS protocol (PORT_FILESYSTEM) ────────────────────────────────────
+/// Операции файловой системы (data[0]). Ответ кладёт статус в data[1]
+/// (0 = OK, 1 = ошибка) и payload в data[2..].
+pub const FS_OP_LS: u8 = 1;
+pub const FS_OP_CAT: u8 = 2;
+pub const FS_OP_READ: u8 = 3;
+pub const FS_OP_WRITE: u8 = 4;
+pub const FS_OP_MKDIR: u8 = 5;
+pub const FS_OP_RM: u8 = 6;
+pub const FS_OP_RMDIR: u8 = 7;
+pub const FS_OP_IS_DIR: u8 = 8;
+pub const FS_OP_SIZE: u8 = 9;
+pub const FS_OP_EXISTS: u8 = 10;
+
+pub const FS_OK: u8 = 0;
+pub const FS_ERR: u8 = 1;
 
 /// Сообщение IPC (80 байт)
 #[repr(C)]
