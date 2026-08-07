@@ -85,6 +85,44 @@ static mut RX_HEAD: usize = 0;
 static mut OUR_MAC: [u8; 6] = [0; 6];
 static OUR_IP: [u8; 4] = [10, 0, 2, 15];
 
+// --- ARP cache: IP -> MAC ---
+const ARP_CACHE: usize = 8;
+#[derive(Clone, Copy)]
+struct ArpEntry {
+    ip: [u8; 4],
+    mac: [u8; 6],
+    valid: bool,
+}
+static mut ARP_ENTRIES: [ArpEntry; ARP_CACHE] = [ArpEntry { ip: [0; 4], mac: [0; 6], valid: false }; ARP_CACHE];
+
+fn arp_slot(ip: &[u8; 4]) -> usize {
+    (ip[0] as usize * 7 + ip[1] as usize * 13 + ip[2] as usize * 17 + ip[3] as usize * 29) % ARP_CACHE
+}
+
+fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
+    unsafe {
+        let i = arp_slot(ip);
+        let e = &ARP_ENTRIES[i];
+        if e.valid && e.ip == *ip { Some(e.mac) } else { None }
+    }
+}
+
+/// Публичный доступ к ARP-кэшу (используется TCP-стеком).
+pub fn arp_lookup_public(ip: &[u8; 4]) -> Option<[u8; 6]> {
+    arp_lookup(ip)
+}
+
+fn arp_learn(ip: [u8; 4], mac: [u8; 6]) {
+    unsafe {
+        let i = arp_slot(&ip);
+        ARP_ENTRIES[i] = ArpEntry { ip, mac, valid: true };
+    }
+}
+
+fn timer_now() -> u64 {
+    crate::timer::millis()
+}
+
 fn mmio_read32(reg: u32) -> u32 {
     let base = unsafe { MMIO };
     if base == 0 { return 0; }
@@ -410,6 +448,7 @@ struct IcmpHdr {
 const ETH_TYPE_ARP: u16 = 0x0608; // в little-endian: 0x0806 на проводе
 const ETH_TYPE_IP: u16 = 0x0008;  // 0x0800
 const ARP_REQUEST: u16 = 0x0100;  // 1 в LE
+const ARP_REPLY: u16 = 0x0200;    // 2 в LE
 const IP_PROTO_ICMP: u8 = 1;
 
 fn ip_checksum(buf: &[u8]) -> u16 {
@@ -526,6 +565,36 @@ pub fn mac() -> [u8; 6] {
     unsafe { OUR_MAC }
 }
 
+/// Наш IPv4-адрес (10.0.2.15 в QEMU slirp).
+pub fn our_ip() -> [u8; 4] {
+    OUR_IP
+}
+
+/// Отправить сырой кадр Ethernet (используется TCP-стеком).
+pub fn send_raw(data: &[u8]) -> bool {
+    tx_send(data)
+}
+
+/// Попытаться резолвить MAC-адрес по IP. Сначала ищет в ARP-кэше; если нет —
+/// шлёт ARP-запрос и качает RX до прихода ответа (или таймаут ms).
+/// Возвращает MAC в случае успеха.
+pub fn resolve(ip: [u8; 4], timeout_ms: u64) -> Option<[u8; 6]> {
+    if let Some(m) = arp_lookup(&ip) {
+        return Some(m);
+    }
+    if !send_arp_request(ip) {
+        return None;
+    }
+    let start = timer_now();
+    while timer_now() < start + timeout_ms {
+        poll();
+        if let Some(m) = arp_lookup(&ip) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Re-apply DMA ring + RX/TX configuration after ExitBootServices.
 /// Register writes performed before EBS can be swallowed by the CPU cache
 /// (UEFI maps PCI MMIO write-back), so we re-issue them post-EBS with the
@@ -631,12 +700,30 @@ pub fn poll() {
                     uart::write_str("[NET] ARP reply to ");
                     print_ip(&arp.sender_ip);
                     uart::write_str("\r\n");
+                    // Learn the requester's MAC-IP binding
+                    arp_learn(arp.sender_ip, arp.sender_mac);
+                }
+                // ARP reply for us: learn our peer's MAC/IP.
+                if arp.op == ARP_REPLY && arp.target_ip == OUR_IP {
+                    arp_learn(arp.sender_ip, arp.sender_mac);
+                    uart::write_str("[NET] ARP learned ");
+                    print_ip(&arp.sender_ip);
+                    uart::write_str(" -> ");
+                    print_mac(&arp.sender_mac);
+                    uart::write_str("\r\n");
                 }
             }
 
-            if eth.ether_type == ETH_TYPE_IP && data.len() >= 42 {
+            if eth.ether_type == ETH_TYPE_IP && data.len() >= 34 {
                 let ip = unsafe { &*(data.as_ptr().add(14) as *const IpHdr) };
-                if ip.protocol == IP_PROTO_ICMP && ip.dst == OUR_IP {
+                if ip.dst != OUR_IP { continue; }
+                if ip.protocol == 6 {
+                    // TCP — передать сегмент TCP-стеку.
+                    let tcp_seg = &data[34..];
+                    crate::driver::tcp::input(ip.src, eth.src, tcp_seg);
+                    continue;
+                }
+                if ip.protocol == IP_PROTO_ICMP {
                     let icmp = unsafe { &*(data.as_ptr().add(14 + 20) as *const IcmpHdr) };
                     if icmp.typ == 8 { // echo request
                         let payload = &data[14 + 20 + 8..];

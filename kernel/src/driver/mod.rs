@@ -3,6 +3,7 @@ pub mod manager;
 pub mod uart;
 pub mod pci;
 pub mod net;
+pub mod tcp;
 pub mod ahci;
 pub mod nvme;
 pub mod ps2;

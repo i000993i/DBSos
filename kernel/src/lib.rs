@@ -221,5 +221,7 @@ pub fn init() {
     let result = crate::elf::load_and_spawn(b"/test/hello.elf");
     if result == 0 { uart_print("[BOOT] spawn FAIL\r\n"); } else { uart_print("[BOOT] spawn OK\r\n"); }
 
+    crate::driver::tcp::test_stack();
+
     shell::run();
 }

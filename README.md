@@ -66,6 +66,8 @@ qemu-system-x86_64 \
 
 > Путь к OVMF может отличаться: `find / -name "OVMF_CODE.fd" 2>/dev/null`
 
+> Тест TCP: в отдельном терминале на хосте запустите `python3 scripts/tcp_echo_server.py 8000`, затем в оболочке DBSos выполните `tcp 10.0.2.2 8000 hello`. QEMU (slirp `10.0.2.2`) пробрасывает соединение на loopback хоста.
+
 ### Windows (PowerShell)
 
 ```powershell
@@ -122,6 +124,7 @@ qemu-system-x86_64 \
 | `write PATH TXT` | Записать файл | | |
 | `rm PATH` | Удалить файл | | |
 | `rmdir PATH` | Удалить директорию | | |
+| `tcp IP PORT TXT` | TCP-стек (клиент) | | |
 
 ---
 
@@ -143,12 +146,12 @@ qemu-system-x86_64 \
 | HPET Timer | ✅ | Display (GOP) | ✅ |
 | Interactive Shell (15+ cmds) | ✅ | PCI Bus | ✅ |
 | Demand Paging (VMA) | ✅ | IRQ-safe Allocator | ✅ |
+| TCP/IP Stack (ARP) | ✅ | e1000 NIC | ✅ |
 
 ### В доработке
 
 | Компонент | Приоритет |
 |-----------|-----------|
-| TCP/IP Stack | Высокий |
 | FS Server (Ring 3) | Средний |
 | DHCP / DNS | Средний |
 | Multi-core (SMP) | Средний |

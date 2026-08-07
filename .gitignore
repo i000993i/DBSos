@@ -16,3 +16,7 @@ limine-binary.tar.gz
 serial.log
 qemu.log
 test_serial.log
+
+# Python
+__pycache__/
+*.pyc

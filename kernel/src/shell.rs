@@ -1,6 +1,7 @@
 use crate::console;
 use crate::driver::uart;
 use crate::driver::net;
+use crate::driver::tcp;
 use crate::driver::nvme;
 use crate::fs;
 use crate::memory;
@@ -58,6 +59,10 @@ fn build_path<'a>(path: &[u8], buf: &'a mut [u8]) -> &'a mut [u8] {
 }
 
 fn w(s: &str) { console::write_str(s); uart::write_str(s); }
+
+fn wb(data: &[u8]) {
+    for &b in data { uart::putchar(b); console::putchar(b); }
+}
 
 fn readline(buf: &mut [u8]) -> usize {
     let mut i = 0;
@@ -121,6 +126,7 @@ fn cmd_help() {
     w("  exec PATH   - run ELF binary\r\n");
     w("  cd PATH     - change directory\r\n  pwd    - print working dir\r\n");
     w("  echo TEXT   - print text\r\n");
+    w("  tcp IP PORT TEXT - TCP connect + send\r\n");
 }
 
 fn cmd_pwd() {
@@ -232,6 +238,116 @@ fn cmd_ping() {
     let deadline = timer::millis() + 2000;
     while timer::millis() < deadline { net::poll(); core::hint::spin_loop(); }
     w("[NET] poll done\r\n");
+}
+
+/// Parse "a.b.c.d" into an IPv4 address. Returns true on success.
+fn parse_ip(s: &[u8], out: &mut [u8; 4]) -> bool {
+    let mut oct = 0u32;
+    let mut part = 0usize;
+    for &c in s {
+        if c >= b'0' && c <= b'9' {
+            if part >= 4 { return false; }
+            oct = oct * 10 + (c - b'0') as u32;
+            if oct > 255 { return false; }
+        } else if c == b'.' {
+            if part >= 4 { return false; }
+            out[part] = oct as u8;
+            part += 1;
+            oct = 0;
+        } else {
+            return false;
+        }
+    }
+    if part != 3 { return false; }
+    out[3] = oct as u8;
+    true
+}
+
+/// `tcp <ip> <port> [text...]` — резолвит MAC, коннектится к хосту,
+/// отправляет `text` и печатает ответ.
+fn cmd_tcp(arg: &[u8]) {
+    let mut ipb = [0u8; 64];
+    let mut portb = [0u8; 8];
+    let mut p = 0usize;
+    // first token: ip
+    while p < arg.len() && arg[p] == b' ' { p += 1; }
+    let mut n = 0usize;
+    while p < arg.len() && arg[p] != b' ' && arg[p] != 0 {
+        if n < ipb.len() { ipb[n] = arg[p]; n += 1; }
+        p += 1;
+    }
+    let ip = &ipb[..n];
+    while p < arg.len() && arg[p] == b' ' { p += 1; }
+    let mut n2 = 0usize;
+    while p < arg.len() && arg[p] != b' ' && arg[p] != 0 {
+        if n2 < portb.len() { portb[n2] = arg[p]; n2 += 1; }
+        p += 1;
+    }
+    // остаток — произвольный текст
+    while p < arg.len() && arg[p] == b' ' { p += 1; }
+    let body = &arg[p..];
+
+    let mut ip4 = [0u8; 4];
+    if !parse_ip(ip, &mut ip4) {
+        w("Usage: tcp <ip> <port> [text]\r\n");
+        return;
+    }
+    let mut port: u32 = 0;
+    for &c in &portb[..n2] {
+        if c < b'0' || c > b'9' { port = u32::MAX; break; }
+        port = port * 10 + (c - b'0') as u32;
+    }
+    if port > 65535 {
+        w("bad port\r\n");
+        return;
+    }
+
+    w("tcp -> "); wb(ip); w(":"); dec(port as u64);
+    w(" msg='"); wb(body); w("'\r\n");
+    if body.is_empty() {
+        w("no payload, just connect+close\r\n");
+    }
+
+    let idx = match tcp::connect(ip4, port as u16) {
+        Some(i) => i,
+        None => { w("connect: no conn slot\r\n"); return; }
+    };
+    if !tcp::wait_established(idx, 5000) {
+        w("handshake failed/timeout\r\n");
+        return;
+    }
+    w("[TCP] established\r\n");
+
+    if !body.is_empty() {
+        if !tcp::send(idx, body) {
+            w("[TCP] send failed\r\n");
+        }
+    }
+
+    // Качаем приём ~3s, печатая полученное.
+    let start = timer::millis();
+    let mut got_any = false;
+    let mut buf = [0u8; 512];
+    while timer::millis() - start < 3000 {
+        let n = tcp::recv(idx, &mut buf);
+        if n > 0 {
+            got_any = true;
+            for &b in &buf[..n] {
+                uart::putchar(b);
+                console::putchar(b);
+            }
+        }
+        tcp::pump();
+        core::hint::spin_loop();
+    }
+    if !got_any {
+        w("\r\n(no reply in 3s)\r\n");
+    }
+    w("\r\n");
+
+    tcp::close(idx);
+    let _ = tcp::wait_closed(idx, 2000);
+    w("[TCP] closed\r\n");
 }
 
 const DARK_RED: u32 = 0x00880000;
@@ -376,7 +492,7 @@ pub fn run() {
     console::set_cursor(0, 12);
 
     loop {
-        net::poll();
+        tcp::pump();
         // Show prompt with cwd
         w("\r\n");
         let cwd = cwd_get();
@@ -442,6 +558,7 @@ pub fn run() {
             else { w("Usage: exec PATH\r\n"); }
         }
         else if cmd == b"ping" { cmd_ping(); }
+        else if cmd == b"tcp" { cmd_tcp(arg); }
         else if cmd == b"reboot" { w("Rebooting...\r\n"); crate::acpi::reboot(); }
         else if cmd == b"poweroff" { w("Shutting down...\r\n"); crate::acpi::shutdown(); }
         else if cmd == b"nvme" { cmd_nvme(&buf); }
