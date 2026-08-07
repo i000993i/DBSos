@@ -127,6 +127,8 @@ fn cmd_help() {
     w("  cd PATH     - change directory\r\n  pwd    - print working dir\r\n");
     w("  echo TEXT   - print text\r\n");
     w("  tcp IP PORT TEXT - TCP connect + send\r\n");
+    w("  dhcp - get config via DHCP\r\n");
+    w("  dns HOSTNAME - resolve A record\r\n");
 }
 
 fn cmd_pwd() {
@@ -232,12 +234,55 @@ fn cmd_info() {
 }
 
 fn cmd_ping() {
-    let gw: [u8; 4] = [10, 0, 2, 1];
+    let gw = net::gateway();
     w("[NET] sending ARP...\r\n");
     net::send_arp_request(gw);
     let deadline = timer::millis() + 2000;
     while timer::millis() < deadline { net::poll(); core::hint::spin_loop(); }
     w("[NET] poll done\r\n");
+}
+
+fn cmd_dhcp() {
+    if crate::driver::dhcp::run(5000) {
+        w("[shell] DHCP OK\r\n");
+    } else {
+        w("[shell] DHCP failed\r\n");
+    }
+}
+
+fn cmd_dns(arg: &[u8]) {
+    // Пропускаем ведущие пробелы, берём первое слово.
+    let mut p = 0;
+    while p < arg.len() && arg[p] == b' ' { p += 1; }
+    let mut end = p;
+    while end < arg.len() && arg[end] != b' ' && arg[end] != 0 { end += 1; }
+    let name = &arg[p..end];
+    if name.is_empty() {
+        w("Usage: dns HOSTNAME\r\n");
+        return;
+    }
+    match crate::driver::dns::resolve(name, 5000) {
+        Some(ip) => {
+            w("resolved: ");
+            w(core::str::from_utf8(name).unwrap_or("?"));
+            w(" -> ");
+            let mut o = [0u8; 64];
+            let mut n = 0;
+            for i in 0..4 {
+                let mut v = ip[i] as u64;
+                let mut d = [0u8; 3];
+                let mut m = 0;
+                while v > 0 { d[m] = b'0' + (v % 10) as u8; v /= 10; m += 1; }
+                if m == 0 { o[n] = b'0'; n += 1; } else {
+                    while m > 0 { m -= 1; o[n] = d[m]; n += 1; }
+                }
+                if i < 3 { o[n] = b'.'; n += 1; }
+            }
+            w(core::str::from_utf8(&o[..n]).unwrap_or("?"));
+            w("\r\n");
+        }
+        None => w("dns: not resolved\r\n"),
+    }
 }
 
 /// Parse "a.b.c.d" into an IPv4 address. Returns true on success.
@@ -558,6 +603,8 @@ pub fn run() {
             else { w("Usage: exec PATH\r\n"); }
         }
         else if cmd == b"ping" { cmd_ping(); }
+        else if cmd == b"dhcp" { cmd_dhcp(); }
+        else if cmd == b"dns" { cmd_dns(arg); }
         else if cmd == b"tcp" { cmd_tcp(arg); }
         else if cmd == b"reboot" { w("Rebooting...\r\n"); crate::acpi::reboot(); }
         else if cmd == b"poweroff" { w("Shutting down...\r\n"); crate::acpi::shutdown(); }

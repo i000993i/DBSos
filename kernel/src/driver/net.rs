@@ -83,7 +83,10 @@ static mut RX_HEAD: usize = 0;
 
 // MAC + IP
 static mut OUR_MAC: [u8; 6] = [0; 6];
-static OUR_IP: [u8; 4] = [10, 0, 2, 15];
+static mut OUR_IP: [u8; 4] = [10, 0, 2, 15];
+static mut OUR_GATEWAY: [u8; 4] = [10, 0, 2, 1];
+static mut OUR_NETMASK: [u8; 4] = [255, 255, 255, 0];
+static mut OUR_DNS: [u8; 4] = [10, 0, 2, 3];
 
 // --- ARP cache: IP -> MAC ---
 const ARP_CACHE: usize = 8;
@@ -450,6 +453,7 @@ const ETH_TYPE_IP: u16 = 0x0008;  // 0x0800
 const ARP_REQUEST: u16 = 0x0100;  // 1 в LE
 const ARP_REPLY: u16 = 0x0200;    // 2 в LE
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_UDP: u8 = 17;
 
 fn ip_checksum(buf: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -479,7 +483,7 @@ fn build_arp_reply(pkt: &mut [u8; 60], sender_mac: &[u8; 6], sender_ip: &[u8; 4]
     pkt[18] = 6; pkt[19] = 4;
     pkt[20] = 0x00; pkt[21] = 0x02; // reply
     pkt[22..28].copy_from_slice(&mac);
-    pkt[28..32].copy_from_slice(&OUR_IP);
+    pkt[28..32].copy_from_slice(&unsafe { OUR_IP });
     pkt[32..38].copy_from_slice(sender_mac);
     pkt[38..42].copy_from_slice(sender_ip);
     42
@@ -504,7 +508,7 @@ fn build_icmp_reply(pkt: &mut [u8; 1514], sender_mac: &[u8; 6], ip_hdr: &IpHdr, 
     pkt[ip_off + 8] = 64; // ttl
     pkt[ip_off + 9] = IP_PROTO_ICMP;
     pkt[ip_off + 10] = 0; pkt[ip_off + 11] = 0; // checksum = 0
-    pkt[ip_off + 12..ip_off + 16].copy_from_slice(&OUR_IP);
+    pkt[ip_off + 12..ip_off + 16].copy_from_slice(&unsafe { OUR_IP });
     pkt[ip_off + 16..ip_off + 20].copy_from_slice(&ip_hdr.src);
     // IP checksum
     let csum = ip_checksum(&pkt[ip_off..ip_off + 20]);
@@ -551,7 +555,7 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> bool {
     pkt[18] = 6; pkt[19] = 4;       // hw/proto len
     pkt[20] = 0x00; pkt[21] = 0x01; // request
     pkt[22..28].copy_from_slice(&mac);
-    pkt[28..32].copy_from_slice(&OUR_IP);
+    pkt[28..32].copy_from_slice(&unsafe { OUR_IP });
     let zero_mac: [u8; 6] = [0; 6];
     pkt[32..38].copy_from_slice(&zero_mac);
     pkt[38..42].copy_from_slice(&target_ip);
@@ -567,12 +571,68 @@ pub fn mac() -> [u8; 6] {
 
 /// Наш IPv4-адрес (10.0.2.15 в QEMU slirp).
 pub fn our_ip() -> [u8; 4] {
-    OUR_IP
+    unsafe { OUR_IP }
+}
+
+pub fn set_ip(ip: [u8; 4]) {
+    unsafe { OUR_IP = ip; }
+}
+
+pub fn gateway() -> [u8; 4] {
+    unsafe { OUR_GATEWAY }
+}
+
+pub fn set_gateway(gw: [u8; 4]) {
+    unsafe { OUR_GATEWAY = gw; }
+}
+
+pub fn netmask() -> [u8; 4] {
+    unsafe { OUR_NETMASK }
+}
+
+pub fn set_netmask(mask: [u8; 4]) {
+    unsafe { OUR_NETMASK = mask; }
+}
+
+pub fn dns_server() -> [u8; 4] {
+    unsafe { OUR_DNS }
+}
+
+pub fn set_dns_server(dns: [u8; 4]) {
+    unsafe { OUR_DNS = dns; }
 }
 
 /// Отправить сырой кадр Ethernet (используется TCP-стеком).
 pub fn send_raw(data: &[u8]) -> bool {
     tx_send(data)
+}
+
+/// Отправить IPv4+UDP-датаграмму.
+/// `dst_mac` — уже зарезолвленный MAC-адрес получателя.
+pub fn send_udp(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
+    let udp_len = 8 + payload.len();
+    let ip_len = 20 + udp_len;
+    let mut frame = [0u8; 1514];
+    frame[0..6].copy_from_slice(&dst_mac);
+    frame[6..12].copy_from_slice(&unsafe { OUR_MAC });
+    frame[12] = 0x08; frame[13] = 0x00;
+    let ip = &mut frame[14..34];
+    ip[0] = 0x45; ip[1] = 0;
+    ip[2] = (ip_len >> 8) as u8; ip[3] = ip_len as u8;
+    ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
+    ip[8] = 64; ip[9] = IP_PROTO_UDP; ip[10] = 0; ip[11] = 0;
+    ip[12..16].copy_from_slice(&src_ip);
+    ip[16..20].copy_from_slice(&dst_ip);
+    let ipc = crate::driver::tcp::checksum_pub(ip);
+    ip[10] = (ipc >> 8) as u8; ip[11] = ipc as u8;
+    frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
+    frame[36] = (dst_port >> 8) as u8; frame[37] = dst_port as u8;
+    frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
+    frame[40] = 0; frame[41] = 0; // csum=0 (optional in IPv4)
+    if !payload.is_empty() {
+        frame[42..42 + payload.len()].copy_from_slice(payload);
+    }
+    tx_send(&frame[..14 + ip_len])
 }
 
 /// Попытаться резолвить MAC-адрес по IP. Сначала ищет в ARP-кэше; если нет —
@@ -664,7 +724,8 @@ pub fn rx_software_test() {
         data[28..32].copy_from_slice(&[10, 0, 2, 1]); // sender IP = gateway
         let zero_mac: [u8; 6] = [0; 6];
         data[32..38].copy_from_slice(&zero_mac);
-        data[38..42].copy_from_slice(&OUR_IP); // target IP = us
+        let self_ip = OUR_IP;
+        data[38..42].copy_from_slice(&self_ip); // target IP = us
 
         // Manually set DD bit in the RX descriptor
         let desc = &mut *RX_RING.add(0);
@@ -693,7 +754,7 @@ pub fn poll() {
 
             if eth.ether_type == ETH_TYPE_ARP && data.len() >= 42 {
                 let arp = unsafe { &*(data.as_ptr().add(14) as *const ArpPkt) };
-                if arp.op == ARP_REQUEST && arp.target_ip == OUR_IP {
+                if arp.op == ARP_REQUEST && arp.target_ip == unsafe { OUR_IP } {
                     let mut resp = [0u8; 60];
                     let len = build_arp_reply(&mut resp, &arp.sender_mac, &arp.sender_ip);
                     tx_send(&resp[..len]);
@@ -704,7 +765,7 @@ pub fn poll() {
                     arp_learn(arp.sender_ip, arp.sender_mac);
                 }
                 // ARP reply for us: learn our peer's MAC/IP.
-                if arp.op == ARP_REPLY && arp.target_ip == OUR_IP {
+                if arp.op == ARP_REPLY && arp.target_ip == unsafe { OUR_IP } {
                     arp_learn(arp.sender_ip, arp.sender_mac);
                     uart::write_str("[NET] ARP learned ");
                     print_ip(&arp.sender_ip);
@@ -716,11 +777,18 @@ pub fn poll() {
 
             if eth.ether_type == ETH_TYPE_IP && data.len() >= 34 {
                 let ip = unsafe { &*(data.as_ptr().add(14) as *const IpHdr) };
-                if ip.dst != OUR_IP { continue; }
+                // Принимаем пакеты для нас, а также broadcast (нужно для DHCP).
+                let ours = ip.dst == unsafe { OUR_IP } || ip.dst == [255, 255, 255, 255];
+                if !ours { continue; }
                 if ip.protocol == 6 {
                     // TCP — передать сегмент TCP-стеку.
                     let tcp_seg = &data[34..];
                     crate::driver::tcp::input(ip.src, eth.src, tcp_seg);
+                    continue;
+                }
+                if ip.protocol == IP_PROTO_UDP {
+                    // UDP — передать DHCP/DNS-обработчикам.
+                    crate::driver::udp::input(data, ip.src, eth.src);
                     continue;
                 }
                 if ip.protocol == IP_PROTO_ICMP {
@@ -813,7 +881,7 @@ impl Driver for E1000Driver {
         uart::write_str("[NET] DMA rings: TX/RX ");
         uart_dec(NUM_DESC as u64);
         uart::write_str(" desc, IP ");
-        print_ip(&OUR_IP);
+        print_ip(&unsafe { OUR_IP });
         uart::write_str("\r\n");
 
         // Check link
@@ -883,7 +951,8 @@ pub fn tx_test() {
         arp[4] = 6; arp[5] = 4; // hw/proto len
         arp[6] = 0x00; arp[7] = 0x01; // request
         arp[8..14].copy_from_slice(&*core::ptr::addr_of!(OUR_MAC));
-        arp[14..18].copy_from_slice(&OUR_IP);
+        let self_ip = OUR_IP;
+        arp[14..18].copy_from_slice(&self_ip);
         let zero_mac: [u8; 6] = [0; 6];
         arp[18..24].copy_from_slice(&zero_mac);
         let gw: [u8; 4] = [10, 0, 2, 1];
@@ -981,7 +1050,7 @@ pub fn send_icmp_ping(target_ip: [u8; 4]) -> bool {
     pkt[22] = 64; // ttl
     pkt[23] = 1;  // ICMP protocol
     pkt[24] = 0; pkt[25] = 0; // checksum = 0
-    pkt[26..30].copy_from_slice(&OUR_IP); // src IP
+    pkt[26..30].copy_from_slice(&unsafe { OUR_IP }); // src IP
     pkt[30..34].copy_from_slice(&target_ip); // dst IP
     // IP checksum
     let csum = ip_checksum(&pkt[14..34]);

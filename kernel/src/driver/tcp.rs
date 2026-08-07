@@ -102,6 +102,11 @@ fn checksum(buf: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Публичный интернет-checksum (используется UDP-стеком из net.rs).
+pub fn checksum_pub(buf: &[u8]) -> u16 {
+    checksum(buf)
+}
+
 fn u32_from(b: &[u8]) -> u32 {
     ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
 }

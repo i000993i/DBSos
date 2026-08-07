@@ -147,13 +147,12 @@ qemu-system-x86_64 \
 | Interactive Shell (15+ cmds) | ✅ | PCI Bus | ✅ |
 | Demand Paging (VMA) | ✅ | IRQ-safe Allocator | ✅ |
 | TCP/IP Stack (ARP) | ✅ | e1000 NIC | ✅ |
+| DHCP / DNS (UDP) | ✅ | FS Server (Ring 3) | ✅ |
 
 ### В доработке
 
 | Компонент | Приоритет |
 |-----------|-----------|
-| FS Server (Ring 3) | Средний |
-| DHCP / DNS | Средний |
 | Multi-core (SMP) | Средний |
 | Backtrace | Низкий |
 | CI/CD | Низкий |

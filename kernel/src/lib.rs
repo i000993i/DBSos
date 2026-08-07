@@ -200,6 +200,13 @@ pub fn init() {
     driver::net::dump_rx_state();
     uart_print("[BOOT] Ping done\r\n");
 
+    // Best-effort DHCP (не блокируем загрузку при неудаче)
+    if crate::driver::dhcp::run(4000) {
+        uart_print("[BOOT] DHCP OK\r\n");
+    } else {
+        uart_print("[BOOT] DHCP failed, keeping static config\r\n");
+    }
+
     // Scheduler + multitasking test
     scheduler::init();
     // IPC test needs scheduler ready

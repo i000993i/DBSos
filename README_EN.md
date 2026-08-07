@@ -143,14 +143,13 @@ qemu-system-x86_64 \
 | HPET Timer | ✅ | Display (GOP) | ✅ |
 | Interactive Shell (15+ cmds) | ✅ | PCI Bus | ✅ |
 | Demand Paging (VMA) | ✅ | IRQ-safe Allocator | ✅ |
+| TCP/IP Stack (ARP) | ✅ | e1000 NIC | ✅ |
+| DHCP / DNS (UDP) | ✅ | FS Server (Ring 3) | ✅ |
 
 ### In Progress
 
 | Component | Priority |
 |-----------|----------|
-| TCP/IP Stack | High |
-| FS Server (Ring 3) | Medium |
-| DHCP / DNS | Medium |
 | Multi-core (SMP) | Medium |
 | Backtrace | Low |
 | CI/CD | Low |
