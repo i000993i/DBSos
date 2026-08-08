@@ -36,7 +36,7 @@ fn encode_name(name: &[u8], out: &mut [u8]) -> Option<usize> {
                 return None; // двойная точка
             }
             pos += 1;
-            out[pos - 1..pos - 1 + label]
+            out[pos..pos + label]
                 .copy_from_slice(&name[i - label..i]);
             pos += label;
             label = 0;
@@ -51,6 +51,15 @@ fn encode_name(name: &[u8], out: &mut [u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn uart_hex(v: u32) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut buf = [0u8; 8];
+    for i in 0..8 {
+        buf[i] = HEX[((v >> (28 - i * 4)) & 0xF) as usize];
+    }
+    uart::write_bytes(&buf);
 }
 
 fn uart_ip(ip: &[u8; 4]) {
@@ -81,8 +90,9 @@ fn rd16(pkt: &[u8], off: usize) -> u16 {
 }
 
 fn read_qname_len(pkt: &[u8], mut off: usize) -> Option<usize> {
-    // Возвращает длину имени в "жирном" виде (с учётом возможных compression-указателей).
-    let mut jumps = 0usize;
+    // Сколько байт занимает имя в пакете (для перехода к следующему полю).
+    // Считаем байты самого имени (label'ы + завершающий 0);
+    // compression-указатель — это ровно 2 байта.
     let mut total = 0usize;
     loop {
         if off >= pkt.len() {
@@ -90,30 +100,14 @@ fn read_qname_len(pkt: &[u8], mut off: usize) -> Option<usize> {
         }
         let len = pkt[off];
         if len == 0 {
-            if jumps == 0 {
-                total += 1;
-            }
+            total += 1;
             return Some(total);
         } else if len & 0xC0 == 0xC0 {
-            if jumps == 0 {
-                total += 2;
-            }
-            jumps += 1;
-            if jumps > 16 {
-                return None;
-            }
+            total += 2;
             return Some(total);
         } else {
-            if jumps == 0 {
-                total += 1 + len as usize + 1;
-            }
+            total += 1 + len as usize;
             off += 1 + len as usize;
-            if off >= pkt.len() {
-                return None;
-            }
-            if jumps > 16 {
-                return None;
-            }
         }
     }
 }
@@ -175,10 +169,20 @@ pub fn resolve(name: &[u8], timeout_ms: u64) -> Option<[u8; 4]> {
         }
         let id = rd16(pl, 0);
         if id != DNS_ID {
+            uart::write_str("[DNS] rxd id=0x");
+            uart_hex(id as u32);
+            uart::write_str(" (want 0x1234)\r\n");
+            udp::rx_clear();
             continue;
         }
         let ancount = rd16(pl, 6);
         if ancount == 0 {
+            uart::write_str("[DNS] rxd ancount=0 flags=0x");
+            uart_hex(rd16(pl, 2) as u32);
+            uart::write_str(" rcode=");
+            uart_hex((rd16(pl, 2) & 0xF) as u32);
+            uart::write_str("\r\n");
+            udp::rx_clear();
             continue;
         }
         // Пропускаем question-секцию

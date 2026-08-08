@@ -188,7 +188,7 @@ pub fn init() {
 
     // Auto-test network ping (send ICMP + poll for reply)
     uart_print("[BOOT] Ping gateway via ICMP...\r\n");
-    let gw: [u8; 4] = [10, 0, 2, 1];
+    let gw = driver::net::gateway();
     driver::net::send_icmp_ping(gw);
     // Wait with delay to let QEMU process the TX packet
     let deadline = timer::millis() + 3000;
@@ -200,8 +200,22 @@ pub fn init() {
     driver::net::dump_rx_state();
     uart_print("[BOOT] Ping done\r\n");
 
+    // Диагностика RX: ARP-resolve шлюза (slirp отвечает на ARP к 10.0.2.2).
+    // Информационно: первый ответ может слегка запаздывать - показателен
+    // только сам факт приёма на последующем DHCP.
+    let gw = driver::net::gateway();
+    uart_print("[BOOT] RX probe: ARP resolve gateway...\r\n");
+    match driver::net::resolve(gw, 4000) {
+        Some(_m) => {
+            uart_print("[BOOT] ARP OK, gateway MAC found -> RX WORKS\r\n");
+        }
+        None => {
+            uart_print("[BOOT] ARP probe: no reply yet (not fatal)\r\n");
+        }
+    }
+
     // Best-effort DHCP (не блокируем загрузку при неудаче)
-    if crate::driver::dhcp::run(4000) {
+    if crate::driver::dhcp::run(6000) {
         uart_print("[BOOT] DHCP OK\r\n");
     } else {
         uart_print("[BOOT] DHCP failed, keeping static config\r\n");

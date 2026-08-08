@@ -84,7 +84,7 @@ static mut RX_HEAD: usize = 0;
 // MAC + IP
 static mut OUR_MAC: [u8; 6] = [0; 6];
 static mut OUR_IP: [u8; 4] = [10, 0, 2, 15];
-static mut OUR_GATEWAY: [u8; 4] = [10, 0, 2, 1];
+static mut OUR_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 static mut OUR_NETMASK: [u8; 4] = [255, 255, 255, 0];
 static mut OUR_DNS: [u8; 4] = [10, 0, 2, 3];
 
@@ -349,6 +349,10 @@ fn enable_rx() {
     mmio_write32(REG_RXDCTL, 0);
     mmio_write32(REG_RCTL, RCTL_EN | RCTL_BSIZE_2048 | RCTL_BAM | RCTL_SECRC | RCTL_UPE | RCTL_MPE);
 
+    // Flush descriptor ring to RAM before handing buffers to the NIC,
+    // otherwise the NIC may read stale/zeroed descriptors (no RX at all).
+    unsafe { core::arch::asm!("wbinvd"); }
+
     // Give all descriptors to the NIC
     mmio_write32(REG_RDT, (NUM_DESC - 1) as u32);
 }
@@ -394,12 +398,14 @@ fn rx_recv() -> Option<(&'static [u8], usize)> {
         let data = core::slice::from_raw_parts(buf as *const u8, len);
         let idx = RX_HEAD;
         RX_HEAD = (RX_HEAD + 1) % NUM_DESC;
-        // Вернуть descriptor обратно NIC
-        let next_rdt = (RX_HEAD + NUM_DESC - 1) % NUM_DESC;
-        mmio_write32(REG_RDT, next_rdt as u32);
         // Сбросить статус
         let d = &mut *RX_RING.add(idx);
         d.status = 0;
+        // Flush очищенного дескриптора к RAM, только потом возвращаем его NIC.
+        core::arch::asm!("wbinvd");
+        // Вернуть descriptor обратно NIC
+        let next_rdt = (RX_HEAD + NUM_DESC - 1) % NUM_DESC;
+        mmio_write32(REG_RDT, next_rdt as u32);
         Some((data, idx))
     }
 }
