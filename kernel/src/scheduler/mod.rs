@@ -2,6 +2,7 @@
 
 pub mod context;
 pub mod lapic;
+pub mod smp;
 pub mod task;
 pub mod spawn;
 pub mod vma;

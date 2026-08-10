@@ -134,6 +134,9 @@ pub fn init() {
 
     acpi::init();
 
+    // Bring up application processors (SMP)
+    scheduler::smp::init();
+
     // Test VM: create new address space, clone kernel, map a page, switch back
     unsafe {
         let new_pml4 = vm::create_address_space();

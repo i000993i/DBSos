@@ -9,6 +9,12 @@ SECTIONS {
         *(.multiboot)
     }
 
+    .smp : ALIGN(4K) {
+        _smp_start = .;
+        *(.smp)
+        _smp_end = .;
+    }
+
     .text : ALIGN(4K) {
         *(.text .text.*)
     }

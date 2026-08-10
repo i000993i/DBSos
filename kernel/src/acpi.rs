@@ -42,6 +42,13 @@ static mut XSDT_LEN: u32 = 0;
 static mut XSDT_COPY: [u8; 8192] = [0u8; 8192];  // max XSDT size
 static mut FADT_PHYS: u64 = 0;
 static mut FADT_COPY: [u8; 256] = [0u8; 256];    // max FADT size
+static mut MADT_PHYS: u64 = 0;
+static mut MADT_LEN: u32 = 0;
+static mut MADT_COPY: [u8; 1024] = [0u8; 1024];  // max MADT size
+pub const MAX_CPU: usize = 8;
+static mut CPU_APIC_IDS: [u8; MAX_CPU] = [0xFF; MAX_CPU];
+static mut NCPU: usize = 0;
+static mut LAPIC_PHYS: u32 = 0;
 static mut RESET_REG_ADDR: u64 = 0;
 static mut RESET_REG_SPACE: u8 = 0;
 static mut RESET_VALUE: u8 = 0;
@@ -113,9 +120,23 @@ pub unsafe fn copy_tables() {
             let mut sig_buf = [0u8; 4];
             copy_from_phys(&mut sig_buf, entry, 4);
             if u32::from_le_bytes(sig_buf) == u32::from_le_bytes(*b"FACP") {
-                fadt_phys = entry;
-                uart_print("[ACPI] FACP at 0x"); uart_hex(entry); uart_print("\r\n");
-                break;
+                if fadt_phys == 0 {
+                    fadt_phys = entry;
+                    uart_print("[ACPI] FACP at 0x"); uart_hex(entry); uart_print("\r\n");
+                }
+            } else if u32::from_le_bytes(sig_buf) == u32::from_le_bytes(*b"APIC") {
+                let mut madt_len_buf = [0u8; 4];
+                copy_from_phys(&mut madt_len_buf, entry.wrapping_add(4), 4);
+                let madt_len = u32::from_le_bytes(madt_len_buf) as usize;
+                if madt_len > MADT_COPY.len() {
+                    uart_print("[ACPI] MADT too big\r\n");
+                } else {
+                    copy_from_phys(&mut MADT_COPY[..madt_len], entry, madt_len);
+                    MADT_PHYS = entry;
+                    MADT_LEN = madt_len as u32;
+                    uart_print("[ACPI] MADT copied, len="); uart_dec(madt_len as u64); uart_print("\r\n");
+                    break;
+                }
             }
         }
 
@@ -158,6 +179,53 @@ pub unsafe fn copy_tables() {
     }
 }
 
+unsafe fn parse_madt() {
+    if MADT_PHYS == 0 || MADT_LEN < 44 {
+        uart_print("[ACPI] MADT not available\r\n");
+        return;
+    }
+    LAPIC_PHYS = u32_at(&MADT_COPY, 36);
+    uart_print("[ACPI] MADT lapic=0x"); uart_hex(LAPIC_PHYS as u64);
+    uart_print(" flags=0x"); uart_hex(u32_at(&MADT_COPY, 40) as u64);
+    uart_print("\r\n");
+
+    let mut off = 44usize;
+    let mut ncpu = 0usize;
+    while off + 2 <= MADT_LEN as usize {
+        let etype = MADT_COPY[off];
+        let elen = MADT_COPY[off + 1] as usize;
+        if elen == 0 || off + elen > MADT_LEN as usize { break; }
+        match etype {
+            0 => {
+                // Processor Local APIC: APIC ID (1), APIC ID (2), flags (4) @ off+4
+                let enabled = u32_at(&MADT_COPY, off + 4) & 1 != 0;
+                let apic_id = MADT_COPY[off + 3];
+                if enabled && ncpu < MAX_CPU {
+                    CPU_APIC_IDS[ncpu] = apic_id;
+                    ncpu += 1;
+                }
+            }
+            9 => {
+                // Local x2APIC: count=1, reserved=3, x2APIC ID (4), flags (4) @ off+4
+                let enabled = u32_at(&MADT_COPY, off + 8) & 1 != 0;
+                let apic_id = u32_at(&MADT_COPY, off + 4) as u8;
+                if enabled && ncpu < MAX_CPU {
+                    CPU_APIC_IDS[ncpu] = apic_id;
+                    ncpu += 1;
+                }
+            }
+            _ => {}
+        }
+        off += elen;
+    }
+    NCPU = ncpu;
+    uart_print("[ACPI] MADT CPUs: "); uart_dec(ncpu as u64); uart_print("\r\n");
+    for i in 0..ncpu {
+        uart_print("  CPU"); uart_dec(i as u64);
+        uart_print(" apic_id=0x"); uart_hex(CPU_APIC_IDS[i] as u64); uart_print("\r\n");
+    }
+}
+
 pub fn init() {
     if unsafe { RSDP_PHYS == 0 } {
         uart_print("[ACPI] no RSDP\r\n");
@@ -167,8 +235,21 @@ pub fn init() {
         uart_print("[ACPI] FADT not copied\r\n");
         return;
     }
+    unsafe { parse_madt(); }
     uart_print("[ACPI] initialized (pre-EBS copy)\r\n");
 }
+
+pub fn ncpu() -> usize { unsafe { NCPU } }
+
+pub fn apic_id_of(index: usize) -> Option<u8> {
+    if index < MAX_CPU && unsafe { CPU_APIC_IDS[index] } != 0xFF {
+        Some(unsafe { CPU_APIC_IDS[index] })
+    } else {
+        None
+    }
+}
+
+pub fn lapic_phys() -> u32 { unsafe { LAPIC_PHYS } }
 
 pub fn reboot() {
     unsafe {

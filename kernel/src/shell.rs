@@ -18,7 +18,14 @@ fn cwd_init() {
 }
 
 fn cwd_get() -> &'static [u8] {
-    unsafe { &CWD[..] }
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(CWD) as *const u8;
+        let len = core::slice::from_raw_parts(ptr, 128)
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(128);
+        &CWD[..len]
+    }
 }
 
 const CWD_SIZE: usize = 256;

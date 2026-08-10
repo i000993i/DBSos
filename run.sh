@@ -18,4 +18,5 @@ exec timeout 30 qemu-system-x86_64 \
   -drive file="$PWD/nvme_disk.img",if=none,id=nvme0,format=raw \
   -device nvme,serial=deadbeef,drive=nvme0 \
   -nographic -no-reboot -m 256M \
+  -smp 2 \
   -nic user,model=e1000
