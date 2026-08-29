@@ -167,7 +167,7 @@ fn find_listener(lport: u16) -> Option<usize> {
     None
 }
 
-fn alloc_conn() -> Option<usize> {
+pub fn alloc_conn() -> Option<usize> {
     for i in 0..MAX_CONNS {
         if !conn(i).in_use {
             *conn(i) = CONN_EMPTY;
@@ -603,6 +603,10 @@ pub fn close(idx: usize) {
 
 pub fn state(idx: usize) -> u8 {
     conn(idx).state
+}
+
+pub fn conn_ref(idx: usize) -> &'static Conn {
+    conn(idx)
 }
 
 pub fn is_open(idx: usize) -> bool {

@@ -1,10 +1,13 @@
 #![no_std]
+#![allow(static_mut_refs)]
 
 pub mod cap;
 pub mod display;
 pub mod driver;
+pub mod fat_driver;
 pub mod fs;
 pub mod fs_server;
+pub mod heap;
 pub mod interrupts;
 pub mod io;
 pub mod ipc;
@@ -12,12 +15,19 @@ pub mod memory;
 pub mod scheduler;
 pub mod shell;
 pub mod timer;
+pub mod vfs;
 pub mod vm;
 pub mod font;
 pub mod console;
 pub mod syscall;
 pub mod acpi;
 pub mod elf;
+pub mod script;
+pub mod wget;
+pub mod pkg;
+pub mod gui;
+pub mod linux;
+pub mod wayland;
 
 fn uart_print(s: &str) { driver::uart::write_str(s); }
 
@@ -84,15 +94,15 @@ pub fn init() {
     uart_dec(dt);
     uart_print("\r\n");
 
-    crate::driver::ahci::init();
-    crate::driver::nvme::init();
-
     uart_print("[GOP] init...\r\n");
     display::init();
+    uart_print("[GOP] draw_str...\r\n");
     display::draw_str(10, 40, "DBSos v0.1", 0xFF, 0xFF, 0x00);
+    uart_print("[GOP] done\r\n");
 
     // Save RSDP address from UEFI config table before ExitBootServices
     // Prefer ACPI2_GUID (v2, has XSDT) over ACPI_GUID (v1)
+    uart_print("[ACPI] scanning config tables...\r\n");
     uefi::system::with_config_table(|entries| {
         let mut found = 0u64;
         for e in entries {
@@ -120,7 +130,9 @@ pub fn init() {
     });
 
     // Copy ACPI table data before ExitBootServices
+    uart_print("[ACPI] copy_tables...\r\n");
     unsafe { acpi::copy_tables(); }
+    uart_print("[ACPI] copy done\r\n");
 
     uart_print("[CPU] ExitBootServices...\r\n");
     unsafe { let _ = uefi::boot::exit_boot_services(None); }
@@ -132,128 +144,30 @@ pub fn init() {
 
     unsafe { vm::init(); }
 
+    // Kernel heap — must come after VM init (needs page table mapping)
+    // 256 initial pages = 1 MiB heap
+    unsafe { heap::init(256); }
+
+    // VFS — virtual filesystem layer
+    crate::vfs::init();
+
+    // FAT driver — mount at "/"
+    crate::fat_driver::init();
+
     acpi::init();
 
-    // Bring up application processors (SMP)
-    scheduler::smp::init();
-
-    // Test VM: create new address space, clone kernel, map a page, switch back
-    unsafe {
-        let new_pml4 = vm::create_address_space();
-        if !new_pml4.is_null() {
-            vm::clone_kernel_mappings(vm::current_pml4() as *mut u64, new_pml4);
-            let test_phys = memory::palloc();
-            if test_phys != 0 {
-                let test_virt = 0x1000000u64; // 16 MB — safe unused area
-                vm::map_page(new_pml4, test_phys, test_virt, vm::PTE_WRITABLE);
-                let lookup = vm::virt_to_phys(new_pml4, test_virt);
-                uart_print("[VM] map test: phys=");
-                uart_hex(test_phys);
-                uart_print(" lookup=");
-                uart_hex(lookup);
-                if lookup == test_phys {
-                    uart_print(" OK\r\n");
-                } else {
-                    uart_print(" MISMATCH\r\n");
-                }
-            }
-        }
-    }
+    // SMP disabled: AP goes wild after SIPI (todo: fix trampoline)
+    // scheduler::smp::init();
 
     unsafe { syscall::init(); }
 
-    // Re-apply e1000 DMA rings + TX/RX config post-EBS (pre-EBS register
-    // writes can be lost to the CPU cache / MMIO write-back mapping).
-    driver::net::reinit_after_ebs();
-
-    // Test NIC TX after EBS
-    driver::net::tx_test();
-
-    // Auto-test FAT ls
-    uart_print("[BOOT] FAT ls:\r\n");
-    crate::fs::ls();
-
-    // Auto-test FAT cat
-    uart_print("[BOOT] FAT cat NVVARS:\r\n");
-    crate::fs::cat(b"NVVARS");
-    uart_print("\r\n--- end ---\r\n");
-
-    // Test FS operations
-    uart_print("[BOOT] FS test: mkdir /test\r\n");
-    crate::fs::mkdir(b"/test");
-    uart_print("[BOOT] FS test: write /test/hello.txt\r\n");
-    crate::fs::write_file(b"/test/hello.txt", b"Hello from NVMe write!\r\n");
-    crate::fs::rm(b"/test/hello.txt");
-    crate::fs::rmdir(b"/test");
-
-    // Software RX test (inject fake ARP into RX ring)
-    driver::net::rx_software_test();
-
-    // Auto-test network ping (send ICMP + poll for reply)
-    uart_print("[BOOT] Ping gateway via ICMP...\r\n");
-    let gw = driver::net::gateway();
-    driver::net::send_icmp_ping(gw);
-    // Wait with delay to let QEMU process the TX packet
-    let deadline = timer::millis() + 3000;
-    while timer::millis() < deadline {
-        driver::net::poll();
-        timer::usleep(5000); // 5ms delay to yield to QEMU
-    }
-    // Debug: check RX ring state
-    driver::net::dump_rx_state();
-    uart_print("[BOOT] Ping done\r\n");
-
-    // Диагностика RX: ARP-resolve шлюза (slirp отвечает на ARP к 10.0.2.2).
-    // Информационно: первый ответ может слегка запаздывать - показателен
-    // только сам факт приёма на последующем DHCP.
-    let gw = driver::net::gateway();
-    uart_print("[BOOT] RX probe: ARP resolve gateway...\r\n");
-    match driver::net::resolve(gw, 4000) {
-        Some(_m) => {
-            uart_print("[BOOT] ARP OK, gateway MAC found -> RX WORKS\r\n");
-        }
-        None => {
-            uart_print("[BOOT] ARP probe: no reply yet (not fatal)\r\n");
-        }
-    }
-
-    // Best-effort DHCP (не блокируем загрузку при неудаче)
-    if crate::driver::dhcp::run(6000) {
-        uart_print("[BOOT] DHCP OK\r\n");
-    } else {
-        uart_print("[BOOT] DHCP failed, keeping static config\r\n");
-    }
-
-    // Scheduler + multitasking test
+    // Scheduler + essential services
     scheduler::init();
-    // IPC test needs scheduler ready
-    ipc::tests::run_test();
-    // Shared memory zero-copy test
-    ipc::shmem_test();
-    // FS server: файловая система как IP-level server
-    if crate::fs_server::init().is_some() {
-        uart_print("[FSS] client cap OK\r\n");
-        crate::fs_server::roundtrip_test();
-    } else {
-        uart_print("[FSS] init FAIL\r\n");
-    }
-    scheduler::test();
-
-    // Enable preemptive multitasking (LAPIC timer)
     scheduler::lapic_timer_init();
     crate::driver::ps2::init(); // PS/2 keyboard (IRQ1)
+    crate::driver::mouse::init(); // PS/2 mouse (IRQ12)
+    crate::driver::uart::enable_irq(); // UART serial RX (IRQ4)
 
-    // Preemption test — 4 worker threads running under LAPIC timer
-    scheduler::preempt_test();
-
-    // Ring-3 user-mode test
-    unsafe { syscall::test_ring3(); }
-
-    // ELF loading from subdirectory test
-    let result = crate::elf::load_and_spawn(b"/test/hello.elf");
-    if result == 0 { uart_print("[BOOT] spawn FAIL\r\n"); } else { uart_print("[BOOT] spawn OK\r\n"); }
-
-    crate::driver::tcp::test_stack();
-
-    shell::run();
+    // Launch graphical desktop
+    crate::gui::run();
 }

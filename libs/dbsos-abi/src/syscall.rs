@@ -52,6 +52,61 @@ pub const SYS_CLOSE: u64 = 33;
 /// Get file size. arg1 = fd.
 /// Returns file size or -1 on error.
 pub const SYS_FSTAT: u64 = 34;
+/// Seek in file. arg1 = fd, arg2 = offset, arg3 = whence (0=SET, 1=CUR, 2=END).
+/// Returns new offset or -1 on error.
+pub const SYS_LSEEK: u64 = 35;
+/// Read directory entries. arg1 = path ptr, arg2 = path len, arg3 = entries buf ptr, arg4 = max entries.
+/// Returns number of entries or -1 on error.
+pub const SYS_READDIR: u64 = 36;
+/// Create directory. arg1 = path ptr, arg2 = path len.
+/// Returns 0 on success or -1 on error.
+pub const SYS_MKDIR: u64 = 37;
+/// Remove directory. arg1 = path ptr, arg2 = path len.
+/// Returns 0 on success or -1 on error.
+pub const SYS_RMDIR: u64 = 38;
+/// Delete file. arg1 = path ptr, arg2 = path len.
+/// Returns 0 on success or -1 on error.
+pub const SYS_UNLINK: u64 = 39;
+/// Duplicate file descriptor. arg1 = old fd.
+/// Returns new fd or -1 on error.
+pub const SYS_DUP: u64 = 43;
+/// Duplicate file descriptor to specific number. arg1 = old fd, arg2 = new fd.
+/// Returns new fd or -1 on error.
+pub const SYS_DUP2: u64 = 44;
+/// Create a pipe. arg1 = fds array ptr (2 u32s: [read_fd, write_fd]).
+/// Returns 0 on success or -1 on error.
+pub const SYS_PIPE: u64 = 45;
+/// Get current working directory. arg1 = buf ptr, arg2 = buf size.
+/// Returns 0 on success or -1 on error.
+pub const SYS_GETCWD: u64 = 46;
+/// Change working directory. arg1 = path ptr, arg2 = path len.
+/// Returns 0 on success or -1 on error.
+pub const SYS_CHDIR: u64 = 47;
+// ── Socket API syscalls ────────────────────────────────────────────
+/// Create a socket. arg1 = domain (AF_INET=2), arg2 = type (SOCK_STREAM=1), arg3 = protocol (0).
+/// Returns socket fd (>= 0) or -1 on error.
+pub const SYS_SOCKET: u64 = 50;
+/// Bind a socket. arg1 = fd, arg2 = sockaddr ptr, arg3 = addrlen.
+/// Returns 0 on success or -1 on error.
+pub const SYS_BIND: u64 = 51;
+/// Listen on a socket. arg1 = fd, arg2 = backlog.
+/// Returns 0 on success or -1 on error.
+pub const SYS_LISTEN: u64 = 52;
+/// Accept a connection. arg1 = fd, arg2 = sockaddr ptr, arg3 = addrlen ptr.
+/// Returns new socket fd or -1 on error.
+pub const SYS_ACCEPT: u64 = 53;
+/// Connect to a remote. arg1 = fd, arg2 = sockaddr ptr, arg3 = addrlen.
+/// Returns 0 on success or -1 on error.
+pub const SYS_CONNECT: u64 = 54;
+/// Send data. arg1 = fd, arg2 = buf ptr, arg3 = len, arg4 = flags.
+/// Returns bytes sent or -1 on error.
+pub const SYS_SEND: u64 = 55;
+/// Receive data. arg1 = fd, arg2 = buf ptr, arg3 = len, arg4 = flags.
+/// Returns bytes received or -1 on error.
+pub const SYS_RECV: u64 = 56;
+/// Shutdown a socket. arg1 = fd, arg2 = how (0=RD, 1=WR, 2=BOTH).
+/// Returns 0 on success or -1 on error.
+pub const SYS_SHUTDOWN: u64 = 57;
 
 /// File open flags
 pub const O_RDONLY: u64 = 0;

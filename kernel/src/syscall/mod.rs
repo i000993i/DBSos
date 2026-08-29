@@ -36,10 +36,16 @@ core::arch::global_asm!(
     "  push rbx",  "  push rbp",  "  push rsi",  "  push rdi",
     "  push r8",   "  push r9",   "  push r10",  "  push r12",
     "  push r13",  "  push r14",  "  push r15",
-    "  mov rcx, [rsp + 12*8]",
-    "  mov rdx, [rsp + 11*8]",
-    "  mov r8,  [rsp + 6*8]",
-    "  mov r9,  [rsp + 5*8]",
+    // Push order: r11, rcx, rax, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15
+    // Stack offsets after push:
+    //   [rsp+12*8]=rax(user num) [rsp+11*8]=rdx(user arg3) [rsp+8*8]=rsi(user arg2)
+    //   [rsp+7*8]=rdi(user arg1) [rsp+4*8]=r10(user arg4)
+    // C ABI: rdi=num, rsi=arg1, rdx=arg2, rcx=arg3, r8=arg4
+    "  mov rdi, [rsp + 12*8]",   // rdi = user rax = num
+    "  mov rsi, [rsp + 7*8]",    // rsi = user rdi = arg1
+    "  mov rdx, [rsp + 8*8]",    // rdx = user rsi = arg2
+    "  mov rcx, [rsp + 11*8]",   // rcx = user rdx = arg3
+    "  mov r8,  [rsp + 4*8]",    // r8  = user r10 = arg4
     "  sub rsp, 32",
     "  call syscall_rust_entry",
     "  add rsp, 32",

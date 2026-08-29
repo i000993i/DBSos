@@ -194,3 +194,16 @@ pub fn poll_char() -> Option<u8> {
 pub fn has_char() -> bool {
     unsafe { KEYBUF_R != KEYBUF_W }
 }
+
+pub struct Ps2Driver;
+
+impl super::traits::Driver for Ps2Driver {
+    fn name(&self) -> &'static str { "PS/2 Keyboard" }
+    fn device_type(&self) -> super::traits::DeviceType {
+        super::traits::DeviceType::Legacy
+    }
+    fn init(&self) -> super::traits::DriverStatus {
+        init();
+        super::traits::DriverStatus::Ok
+    }
+}

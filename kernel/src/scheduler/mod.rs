@@ -110,6 +110,18 @@ pub static mut TASKS: [Task; MAX_TASKS] = [const { Task::free() }; MAX_TASKS];
 pub static mut CURRENT: usize = 0;
 pub static mut NEXT_ID: u64 = 1;
 
+pub fn current_task_id() -> u64 {
+    unsafe { TASKS[CURRENT].id }
+}
+
+pub fn next_task_id() -> u64 {
+    unsafe {
+        let id = NEXT_ID;
+        NEXT_ID += 1;
+        id
+    }
+}
+
 pub unsafe fn find_task(id: u64) -> Option<usize> {
     (0..MAX_TASKS).find(|&i| TASKS[i].state != TaskState::Free && TASKS[i].id == id)
 }

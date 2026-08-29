@@ -314,6 +314,19 @@ pub unsafe fn init() {
     map_page(phys as *mut u64, 0xFEE00000, 0xFEE00000, PTE_WRITABLE | PTE_CACHE_DISABLE);
     uart_print("[VM] LAPIC mapped\r\n");
 
+    // Make the page table area (2MB at 0xF800000) writable so that
+    // heap::init and other code can modify page tables after WP is re-enabled.
+    // With WP=0 the write goes through even though the PDE is currently R/O.
+    {
+        let pdpt_phys = phys_from_pte(get_pte(table_from_phys(phys), 0)); // PML4[0] → PDPT
+        let pd_phys = phys_from_pte(get_pte(table_from_phys(pdpt_phys), 0)); // PDPT[0] → PD
+        let pd = table_from_phys(pd_phys);
+        let pde_idx = pd_index(0xF800000);
+        let pde_val = get_pte(pd, pde_idx);
+        set_pte(pd, pde_idx, pde_val | PTE_WRITABLE);
+        core::arch::asm!("invlpg [{}]", in(reg) 0xF800000u64);
+    }
+
     // Re-enable WP
     {
         let mut cr0: u64;

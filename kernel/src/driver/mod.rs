@@ -10,6 +10,7 @@ pub mod dns;
 pub mod ahci;
 pub mod nvme;
 pub mod ps2;
+pub mod mouse;
 
 use traits::*;
 
@@ -17,6 +18,9 @@ static DRIVERS: &[DriverEntry] = &[
     &uart::UartDriver,
     &pci::PciBusDriver,
     &net::E1000Driver,
+    &nvme::NvmeDriver,
+    // ahci disabled: hangs in port_init (SATA controller unresponsive on QEMU)
+    // ps2 removed: initialized later after IDT/PIC is ready (lib.rs:262)
 ];
 
 pub fn init() {

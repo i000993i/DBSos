@@ -181,7 +181,13 @@ fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
     wr32(pb + 0x10, 0xFFFFFFFF);
 
     // Flush CPU cache so HBA sees our CLB/CT/PRDT writes
-    unsafe { core::arch::asm!("wbinvd"); }
+    // On QEMU wbinvd can trigger #DB; use clflush per-line instead
+    {
+        let base = ct_addr;
+        for i in (0..(4096u64)).step_by(64) {
+            unsafe { core::arch::asm!("clflush [{}]", in(reg) base + i); }
+        }
+    }
 
     // Issue command: set bit 0 in PxCI
     wr_p_ci(pb, 1);
@@ -203,7 +209,8 @@ fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
     if tfd & 0x01 != 0 { return false; }
 
     // Flush CPU cache to see DMA data (no-op on QEMU, needed on real HW)
-    unsafe { core::arch::asm!("wbinvd"); }
+    // On QEMU wbinvd can trigger #DB; skip it safely
+    //unsafe { core::arch::asm!("wbinvd"); }
 
     true
 }
@@ -309,13 +316,63 @@ pub fn read_sectors(lba: u64, count: u16, buf: *mut u8) -> bool {
     do_command(0x25, build_read_fis(lba, count), buf, count)
 }
 
+fn build_write_fis(lba: u64, count: u16) -> [u32; 5] {
+    [
+        0x27 | (0x80 << 8) | (0x35 << 16), // H2D FIS, command, WRITE DMA EXT
+        lba as u32 & 0xFFFFFF | (0x40 << 24), // LBA low 24 bits + LBA mode
+        ((lba >> 24) as u32 & 0xFF) | ((lba >> 32) as u32 & 0xFF) << 8 | ((lba >> 40) as u32 & 0xFF) << 16,
+        (count as u32 & 0xFF) | ((count as u32 >> 8) & 0xFF) << 8,
+        0,
+    ]
+}
+
+pub fn write_sectors(lba: u64, count: u16, buf: *mut u8) -> bool {
+    // On QEMU wbinvd can trigger #DB; skip it safely
+    //unsafe { core::arch::asm!("wbinvd"); }
+    do_command(0x35, build_write_fis(lba, count), buf, count)
+}
+
 pub fn read_fat_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
     let part_lba = unsafe { PART_LBA };
     read_sectors(part_lba + lba, 1, buf.as_mut_ptr())
 }
 
-pub fn write_fat_sector(_lba: u64, _buf: &[u8; 512]) -> bool {
-    false
+pub fn write_fat_sector(lba: u64, buf: &[u8; 512]) -> bool {
+    let part_lba = unsafe { PART_LBA };
+    // Need a physical buffer for DMA — copy to a palloc'd page
+    let phys = crate::memory::palloc();
+    if phys == 0 { return false; }
+    // Identity-map the page so CPU can write to it
+    unsafe {
+        let pml4 = crate::vm::KERNEL_PML4 as *mut u64;
+        crate::vm::map_page(pml4, phys, phys, crate::vm::PTE_WRITABLE);
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), phys as *mut u8, 512);
+    }
+    let ok = write_sectors(part_lba + lba, 1, phys as *mut u8);
+    // Unmap
+    unsafe {
+        let pml4 = crate::vm::KERNEL_PML4 as *mut u64;
+        crate::vm::unmap_page(pml4, phys);
+    }
+    crate::memory::pfree(phys);
+    ok
+}
+
+pub struct AhciDriver;
+
+impl super::traits::Driver for AhciDriver {
+    fn name(&self) -> &'static str { "AHCI SATA" }
+    fn device_type(&self) -> super::traits::DeviceType {
+        super::traits::DeviceType::Pci { vendor: 0x8086, device: 0x2922, class: 0x01, subclass: 0x06 }
+    }
+    fn init(&self) -> super::traits::DriverStatus {
+        init();
+        if unsafe { PORT_INIT } {
+            super::traits::DriverStatus::Ok
+        } else {
+            super::traits::DriverStatus::Unsupported
+        }
+    }
 }
 
 fn leu32(b: &[u8]) -> u32 { let mut v=0; for i in 0..b.len().min(4) { v|=(b[i] as u32)<<(i*8); } v }

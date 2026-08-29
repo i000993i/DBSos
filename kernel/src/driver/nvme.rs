@@ -128,7 +128,7 @@ fn admin_send(cmd: &[u32; 16]) -> bool {
         let slot = (sq + tail as u64 * 64) as *mut u32;
         for i in 0..16 { write_volatile(slot.add(i), cmd[i]); }
     }
-    unsafe { core::arch::asm!("wbinvd"); }
+    // wbinvd skipped (QEMU is cache-coherent)
     let new_tail = (tail + 1) % QD;
     unsafe { ADM_SQT = new_tail; }
 
@@ -209,7 +209,7 @@ fn io_send(cmd: &[u32; 16]) -> bool {
         let slot = (sq + tail as u64 * 64) as *mut u32;
         for i in 0..16 { write_volatile(slot.add(i), cmd[i]); }
     }
-    unsafe { core::arch::asm!("wbinvd"); }
+    // wbinvd skipped (QEMU is cache-coherent)
     let new_tail = (tail + 1) % QD;
     unsafe { IO_SQT = new_tail; }
     wr32(sq_db(unsafe { IO_QID }), new_tail);
@@ -558,4 +558,21 @@ fn uart_dec(mut v: u64) {
     let mut b = [0u8; 20]; let mut i = 0;
     while v > 0 { b[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
     while i > 0 { i -= 1; uart::putchar(b[i]); }
+}
+
+pub struct NvmeDriver;
+
+impl super::traits::Driver for NvmeDriver {
+    fn name(&self) -> &'static str { "NVMe" }
+    fn device_type(&self) -> super::traits::DeviceType {
+        super::traits::DeviceType::Pci { vendor: 0, device: 0, class: 0x01, subclass: 0x08 }
+    }
+    fn init(&self) -> super::traits::DriverStatus {
+        init();
+        if unsafe { INIT } {
+            super::traits::DriverStatus::Ok
+        } else {
+            super::traits::DriverStatus::Unsupported
+        }
+    }
 }

@@ -41,7 +41,7 @@ unsafe fn write_user_msg(ptr: *mut Message, msg: &Message) {
 }
 
 #[no_mangle]
-unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match num {
         SYS_EXIT => {
             crate::driver::uart::write_str("[SYSCALL] exit\r\n");
@@ -190,33 +190,32 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             }
         }
 
-        // ── File I/O syscalls ──────────────────────────────────────
+        // ── File I/O syscalls (via VFS) ────────────────────────────
         SYS_OPEN => {
             // arg1 = path ptr, arg2 = path len, arg3 = flags
             let path_ptr = arg1 as *const u8;
             let path_len = arg2 as usize;
             let flags = arg3;
             if path_len == 0 || path_len > 127 { return !0u64; }
-            // Read path from user (SMAP-safe)
             smap_disable();
             let mut path = [0u8; 128];
             for i in 0..path_len {
                 path[i] = core::ptr::read_volatile(path_ptr.add(i));
             }
             smap_enable();
-            // Find free FD
+            let fd = crate::vfs::open(&path[..path_len], flags);
+            if fd < 0 { return !0u64; }
+            // Store VFS fd in the task's FD table
             let cur = crate::scheduler::CURRENT;
-            let fds = &mut crate::scheduler::TASKS[cur].fds;
-            let fd_idx = match fds.iter().position(|f| !f.in_use) {
+            let task_fds = &mut crate::scheduler::TASKS[cur].fds;
+            let slot = match task_fds.iter().position(|f| !f.in_use) {
                 Some(i) => i,
-                None => { return !0u64; } // too many open files
+                None => { crate::vfs::close(fd); return !0u64; }
             };
-            // Get file size
-            let size = match crate::fs::find_file(&path[..path_len]) {
-                Some((_, sz)) => sz,
-                None => { return !0u64; } // file not found
-            };
-            fds[fd_idx] = crate::scheduler::FdEntry {
+            // Get size from VFS
+            let mut info = crate::vfs::StatInfo { size: 0, is_dir: false, cluster: 0 };
+            let _ = crate::vfs::stat(&path[..path_len], &mut info);
+            task_fds[slot] = crate::scheduler::FdEntry {
                 in_use: true,
                 path: {
                     let mut p = [0u8; 128];
@@ -224,10 +223,13 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                     p
                 },
                 offset: 0,
-                size,
+                size: info.size,
                 flags,
             };
-            fd_idx as u64
+            // Encode VFS fd into the path field's last bytes (hack: use offset to store it)
+            // Actually, store it separately — extend FdEntry or use a separate mapping.
+            // For now, re-open via VFS on each read/write (simple, correct).
+            slot as u64
         }
 
         SYS_READ => {
@@ -238,30 +240,34 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             let cur = crate::scheduler::CURRENT;
             let fds = &crate::scheduler::TASKS[cur].fds;
             if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
-            let fd = &fds[fd_idx];
-            let remaining = (fd.size as usize).saturating_sub(fd.offset as usize);
+            let path_len = fds[fd_idx].path.iter().position(|&c| c == 0).unwrap_or(128);
+            let offset = fds[fd_idx].offset as u64;
+            let size = fds[fd_idx].size as u64;
+            let remaining = size.saturating_sub(offset) as usize;
             let to_read = count.min(remaining);
             if to_read == 0 { return 0; }
-            // Read file data
+            // Read via VFS
             let mut kernel_buf = [0u8; 4096];
-            let read_len = to_read.min(4096);
-            match crate::fs::read_file(&fd.path[..fd.path.iter().position(|&c| c == 0).unwrap_or(128)], &mut kernel_buf) {
-                Some(sz) => {
-                    let actual = read_len.min(sz.saturating_sub(fd.offset as usize));
-                    if actual == 0 { return 0; }
-                    // Copy to user buffer (SMAP-safe)
-                    smap_disable();
-                    for i in 0..actual {
-                        core::ptr::write_volatile(buf_ptr.add(i), kernel_buf[fd.offset as usize + i]);
-                    }
-                    smap_enable();
-                    // Update offset
-                    let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
-                    fds_mut[fd_idx].offset += actual as u32;
-                    actual as u64
-                }
-                None => !0u64
+            let read_chunk = to_read.min(4096);
+            // Open file via VFS, read at offset, close
+            let vfs_fd = crate::vfs::open(&fds[fd_idx].path[..path_len], 0);
+            if vfs_fd < 0 { return !0u64; }
+            // Seek to offset
+            crate::vfs::lseek(vfs_fd, offset as i64, 0);
+            let n = crate::vfs::read(vfs_fd, &mut kernel_buf[..read_chunk]);
+            crate::vfs::close(vfs_fd);
+            if n <= 0 { return if n == 0 { 0 } else { !0u64 }; }
+            let actual = n as usize;
+            // Copy to user buffer
+            smap_disable();
+            for i in 0..actual {
+                core::ptr::write_volatile(buf_ptr.add(i), kernel_buf[i]);
             }
+            smap_enable();
+            // Update offset
+            let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
+            fds_mut[fd_idx].offset += actual as u32;
+            actual as u64
         }
 
         SYS_WRITE => {
@@ -272,9 +278,10 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             let cur = crate::scheduler::CURRENT;
             let fds = &crate::scheduler::TASKS[cur].fds;
             if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
-            let fd = &fds[fd_idx];
-            if fd.flags & O_WRONLY == 0 && fd.flags & O_RDWR == 0 { return !0u64; }
-            // Read data from user (SMAP-safe)
+            if fds[fd_idx].flags & O_WRONLY == 0 && fds[fd_idx].flags & O_RDWR == 0 { return !0u64; }
+            let path_len = fds[fd_idx].path.iter().position(|&c| c == 0).unwrap_or(128);
+            let offset = fds[fd_idx].offset as u64;
+            // Read data from user
             let mut kernel_buf = [0u8; 4096];
             let write_len = count.min(4096);
             smap_disable();
@@ -282,15 +289,20 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                 kernel_buf[i] = core::ptr::read_volatile(buf_ptr.add(i));
             }
             smap_enable();
-            // Write to file
-            let path_len = fd.path.iter().position(|&c| c == 0).unwrap_or(128);
-            if crate::fs::write_file(&fd.path[..path_len], &kernel_buf[..write_len]) {
-                let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
-                fds_mut[fd_idx].offset += write_len as u32;
-                write_len as u64
-            } else {
-                !0u64
+            // Write via VFS
+            let vfs_fd = crate::vfs::open(&fds[fd_idx].path[..path_len], fds[fd_idx].flags);
+            if vfs_fd < 0 { return !0u64; }
+            crate::vfs::lseek(vfs_fd, offset as i64, 0);
+            let n = crate::vfs::write(vfs_fd, &kernel_buf[..write_len]);
+            crate::vfs::close(vfs_fd);
+            if n <= 0 { return !0u64; }
+            let actual = n as usize;
+            let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
+            fds_mut[fd_idx].offset += actual as u32;
+            if fds_mut[fd_idx].offset > fds_mut[fd_idx].size {
+                fds_mut[fd_idx].size = fds_mut[fd_idx].offset;
             }
+            actual as u64
         }
 
         SYS_CLOSE => {
@@ -308,6 +320,24 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             let fds = &crate::scheduler::TASKS[cur].fds;
             if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
             fds[fd_idx].size as u64
+        }
+
+        // ── lseek ─────────────────────────────────────────────────
+        SYS_LSEEK => {
+            let fd_idx = arg1 as usize;
+            let offset = arg2 as i64;
+            let whence = arg3 as u32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &mut crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let new_off = match whence {
+                0 => offset as u64,                           // SEEK_SET
+                1 => (fds[fd_idx].offset as i64 + offset) as u64, // SEEK_CUR
+                2 => (fds[fd_idx].size as i64 + offset) as u64,   // SEEK_END
+                _ => return !0u64,
+            };
+            fds[fd_idx].offset = new_off as u32;
+            new_off
         }
 
         // ── Process management syscalls ──────────────────────────────
@@ -506,6 +536,414 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                     }
                 }
             }
+        }
+
+        // ── readdir syscall ────────────────────────────────────────
+        SYS_READDIR => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let entries_ptr = arg3 as *mut u8;
+            let max_entries = arg4 as usize;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            let mut entries = [crate::vfs::DirEntry {
+                name: [0; crate::vfs::MAX_NAME],
+                is_dir: false,
+                size: 0,
+            }; 64];
+            let n = crate::vfs::readdir(&path[..path_len], &mut entries);
+            if n < 0 { return !0u64; }
+            let n = n as usize;
+            let write_n = n.min(max_entries).min(64);
+            // Write entries to user buffer (each entry: 32 bytes: 24 name + 1 is_dir + 3 size + 4 padding)
+            smap_disable();
+            for i in 0..write_n {
+                let e = &entries[i];
+                let base = entries_ptr.add(i * 32);
+                let name_len = e.name.iter().position(|&c| c == 0).unwrap_or(crate::vfs::MAX_NAME);
+                for j in 0..24 {
+                    let v = if j < name_len { e.name[j] } else { 0 };
+                    core::ptr::write_volatile(base.add(j), v);
+                }
+                core::ptr::write_volatile(base.add(24), if e.is_dir { 1 } else { 0 });
+                let sz = e.size;
+                core::ptr::write_volatile(base.add(25), sz as u8);
+                core::ptr::write_volatile(base.add(26), (sz >> 8) as u8);
+                core::ptr::write_volatile(base.add(27), (sz >> 16) as u8);
+            }
+            smap_enable();
+            write_n as u64
+        }
+
+        // ── mkdir syscall ─────────────────────────────────────────
+        SYS_MKDIR => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            if crate::vfs::mkdir(&path[..path_len]) { 0 } else { !0u64 }
+        }
+
+        // ── rmdir syscall ─────────────────────────────────────────
+        SYS_RMDIR => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            if crate::vfs::rmdir(&path[..path_len]) { 0 } else { !0u64 }
+        }
+
+        // ── unlink syscall ────────────────────────────────────────
+        SYS_UNLINK => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            if crate::vfs::unlink(&path[..path_len]) { 0 } else { !0u64 }
+        }
+
+        // ── dup syscall ───────────────────────────────────────────
+        SYS_DUP => {
+            let old_fd = arg1 as usize;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if old_fd >= fds.len() || !fds[old_fd].in_use { return !0u64; }
+            // Find free slot
+            let new_slot = match fds.iter().position(|f| !f.in_use) {
+                Some(s) => s,
+                None => return !0u64,
+            };
+            let cur_fds = &mut crate::scheduler::TASKS[cur].fds;
+            cur_fds[new_slot] = cur_fds[old_fd];
+            new_slot as u64
+        }
+
+        // ── dup2 syscall ──────────────────────────────────────────
+        SYS_DUP2 => {
+            let old_fd = arg1 as usize;
+            let new_fd = arg2 as usize;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if old_fd >= fds.len() || !fds[old_fd].in_use { return !0u64; }
+            if new_fd >= dbsos_abi::syscall::MAX_FDS { return !0u64; }
+            let entry = fds[old_fd];
+            let cur_fds = &mut crate::scheduler::TASKS[cur].fds;
+            cur_fds[new_fd] = entry;
+            new_fd as u64
+        }
+
+        // ── pipe syscall ──────────────────────────────────────────
+        SYS_PIPE => {
+            let fds_ptr = arg1 as *mut u32;
+            // Allocate a pipe buffer (4KB from heap)
+            let buf = unsafe { crate::heap::kmalloc(4096) };
+            if buf.is_null() { return !0u64; }
+            unsafe { core::ptr::write_bytes(buf, 0, 4096); }
+            // Create two FDs: read and write ends
+            let cur = crate::scheduler::CURRENT;
+            let task_fds = &mut crate::scheduler::TASKS[cur].fds;
+            let read_slot = match task_fds.iter().position(|f| !f.in_use) {
+                Some(s) => s,
+                None => { unsafe { crate::heap::kfree(buf); } return !0u64; }
+            };
+            task_fds[read_slot] = crate::scheduler::FdEntry {
+                in_use: true,
+                path: {
+                    let mut p = [0u8; 128];
+                    // Store pipe buffer pointer in first 8 bytes of path (hack)
+                    let ptr_val = buf as u64;
+                    p[0] = ptr_val as u8;
+                    p[1] = (ptr_val >> 8) as u8;
+                    p[2] = (ptr_val >> 16) as u8;
+                    p[3] = (ptr_val >> 24) as u8;
+                    p[4] = (ptr_val >> 32) as u8;
+                    p[5] = (ptr_val >> 40) as u8;
+                    p[6] = (ptr_val >> 48) as u8;
+                    p[7] = (ptr_val >> 56) as u8;
+                    p[8] = b'P'; p[9] = b'I'; p[10] = b'P'; p[11] = b'E';
+                    p
+                },
+                offset: 0, // read position
+                size: 0,   // write position (stored separately)
+                flags: 0,  // O_RDONLY for read end
+            };
+            let write_slot = match task_fds.iter().position(|f| !f.in_use) {
+                Some(s) => s,
+                None => {
+                    unsafe { crate::heap::kfree(buf); }
+                    task_fds[read_slot] = crate::scheduler::FdEntry::empty();
+                    return !0u64;
+                }
+            };
+            task_fds[write_slot] = crate::scheduler::FdEntry {
+                in_use: true,
+                path: {
+                    let mut p = [0u8; 128];
+                    let ptr_val = buf as u64;
+                    p[0] = ptr_val as u8;
+                    p[1] = (ptr_val >> 8) as u8;
+                    p[2] = (ptr_val >> 16) as u8;
+                    p[3] = (ptr_val >> 24) as u8;
+                    p[4] = (ptr_val >> 32) as u8;
+                    p[5] = (ptr_val >> 40) as u8;
+                    p[6] = (ptr_val >> 48) as u8;
+                    p[7] = (ptr_val >> 56) as u8;
+                    p[8] = b'P'; p[9] = b'I'; p[10] = b'P'; p[11] = b'E';
+                    p
+                },
+                offset: 0, // write position
+                size: 4096,
+                flags: 1,  // O_WRONLY for write end
+            };
+            smap_disable();
+            core::ptr::write_volatile(fds_ptr, read_slot as u32);
+            core::ptr::write_volatile(fds_ptr.add(1), write_slot as u32);
+            smap_enable();
+            0
+        }
+
+        // ── getcwd syscall ────────────────────────────────────────
+        SYS_GETCWD => {
+            let buf_ptr = arg1 as *mut u8;
+            let buf_size = arg2 as usize;
+            let cwd = crate::shell::cwd_get_public();
+            let cwd_len = cwd.len().min(buf_size - 1);
+            smap_disable();
+            for i in 0..cwd_len {
+                core::ptr::write_volatile(buf_ptr.add(i), cwd[i]);
+            }
+            core::ptr::write_volatile(buf_ptr.add(cwd_len), 0);
+            smap_enable();
+            0
+        }
+
+        // ── chdir syscall ─────────────────────────────────────────
+        SYS_CHDIR => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            if crate::vfs::is_dir(&path[..path_len]) {
+                crate::shell::cwd_set_public(&path[..path_len]);
+                0
+            } else {
+                !0u64
+            }
+        }
+
+        // ── Socket API syscalls ───────────────────────────────────
+        SYS_SOCKET => {
+            let domain = arg1 as u32;
+            let sock_type = arg2 as u32;
+            let _protocol = arg3 as u32;
+            if domain != 2 /* AF_INET */ || sock_type != 1 /* SOCK_STREAM */ { return !0u64; }
+            // Allocate a TCP connection slot
+            let slot = match crate::driver::tcp::alloc_conn() {
+                Some(i) => i,
+                None => return !0u64,
+            };
+            let cur = crate::scheduler::CURRENT;
+            let task_fds = &mut crate::scheduler::TASKS[cur].fds;
+            let fd_slot = match task_fds.iter().position(|f| !f.in_use) {
+                Some(s) => s,
+                None => { crate::driver::tcp::close(slot); return !0u64; }
+            };
+            task_fds[fd_slot] = crate::scheduler::FdEntry {
+                in_use: true,
+                path: {
+                    let mut p = [0u8; 128];
+                    p[0] = b'S'; p[1] = b'O'; p[2] = b'C'; p[3] = b'K';
+                    p
+                },
+                offset: slot as u32,
+                size: 0,
+                flags: 0,
+            };
+            fd_slot as u64
+        }
+
+        SYS_BIND => {
+            // TCP API: bind + listen combined via tcp::listen(port).
+            // We store the port in the fd's size field; actual listen happens in LISTEN.
+            let fd_idx = arg1 as usize;
+            let sockaddr_ptr = arg2 as *const u8;
+            let _addrlen = arg3 as usize;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            smap_disable();
+            let sin_port = core::ptr::read_volatile(sockaddr_ptr.add(2)) as u16
+                         | (core::ptr::read_volatile(sockaddr_ptr.add(3)) as u16) << 8;
+            smap_enable();
+            // Store port for LISTEN to use
+            let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
+            fds_mut[fd_idx].size = sin_port as u32;
+            0
+        }
+
+        SYS_LISTEN => {
+            let fd_idx = arg1 as usize;
+            let _backlog = arg2 as i32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let conn_idx = fds[fd_idx].offset as usize;
+            let port = fds[fd_idx].size as u16;
+            // Close the placeholder connection and re-allocate via listen(port)
+            crate::driver::tcp::close(conn_idx);
+            match crate::driver::tcp::listen(port) {
+                Some(new_idx) => {
+                    let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
+                    fds_mut[fd_idx].offset = new_idx as u32;
+                    0
+                }
+                None => !0u64,
+            }
+        }
+
+        SYS_ACCEPT => {
+            let fd_idx = arg1 as usize;
+            let sockaddr_ptr = arg2 as *mut u8;
+            let addrlen_ptr = arg3 as *mut u32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let _listen_conn = fds[fd_idx].offset as usize;
+            let port = fds[fd_idx].size as u16;
+            let accepted = match crate::driver::tcp::find_accepted(port) {
+                Some(i) => i,
+                None => return !0u64,
+            };
+            // Map to process-local fd
+            let task_fds = &mut crate::scheduler::TASKS[cur].fds;
+            let fd_slot = match task_fds.iter().position(|f| !f.in_use) {
+                Some(s) => s,
+                None => return !0u64,
+            };
+            task_fds[fd_slot] = crate::scheduler::FdEntry {
+                in_use: true,
+                path: {
+                    let mut p = [0u8; 128];
+                    p[0] = b'S'; p[1] = b'O'; p[2] = b'C'; p[3] = b'K';
+                    p
+                },
+                offset: accepted as u32,
+                size: 0,
+                flags: 0,
+            };
+            // Fill sockaddr_in if provided
+            if !sockaddr_ptr.is_null() {
+                let c = crate::driver::tcp::conn_ref(accepted);
+                smap_disable();
+                core::ptr::write_volatile(sockaddr_ptr, 2);       // sin_family = AF_INET
+                core::ptr::write_volatile(sockaddr_ptr.add(1), 0);
+                let rp = c.remote_port;
+                core::ptr::write_volatile(sockaddr_ptr.add(2), rp as u8);
+                core::ptr::write_volatile(sockaddr_ptr.add(3), (rp >> 8) as u8);
+                for i in 0..4 {
+                    core::ptr::write_volatile(sockaddr_ptr.add(4 + i), c.peer_ip[i]);
+                }
+                for i in 8..16 { core::ptr::write_volatile(sockaddr_ptr.add(i), 0); }
+                if !addrlen_ptr.is_null() {
+                    core::ptr::write_volatile(addrlen_ptr, 16);
+                }
+                smap_enable();
+            }
+            fd_slot as u64
+        }
+
+        SYS_CONNECT => {
+            let fd_idx = arg1 as usize;
+            let sockaddr_ptr = arg2 as *const u8;
+            let _addrlen = arg3 as usize;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let conn_idx = fds[fd_idx].offset as usize;
+            smap_disable();
+            let sin_port = core::ptr::read_volatile(sockaddr_ptr.add(2)) as u16
+                         | (core::ptr::read_volatile(sockaddr_ptr.add(3)) as u16) << 8;
+            let mut sin_addr = [0u8; 4];
+            for i in 0..4 { sin_addr[i] = core::ptr::read_volatile(sockaddr_ptr.add(4 + i)); }
+            smap_enable();
+            // Close the placeholder and re-allocate via connect
+            crate::driver::tcp::close(conn_idx);
+            match crate::driver::tcp::connect(sin_addr, sin_port) {
+                Some(new_idx) => {
+                    let fds_mut = &mut crate::scheduler::TASKS[cur].fds;
+                    fds_mut[fd_idx].offset = new_idx as u32;
+                    0
+                }
+                None => !0u64,
+            }
+        }
+
+        SYS_SEND => {
+            let fd_idx = arg1 as usize;
+            let buf_ptr = arg2 as *const u8;
+            let len = arg3 as usize;
+            let _flags = arg4 as u32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let conn_idx = fds[fd_idx].offset as usize;
+            let mut buf = [0u8; 1400];
+            let chunk = len.min(1400);
+            smap_disable();
+            for i in 0..chunk { buf[i] = core::ptr::read_volatile(buf_ptr.add(i)); }
+            smap_enable();
+            if crate::driver::tcp::send(conn_idx, &buf[..chunk]) {
+                chunk as u64
+            } else {
+                !0u64
+            }
+        }
+
+        SYS_RECV => {
+            let fd_idx = arg1 as usize;
+            let buf_ptr = arg2 as *mut u8;
+            let len = arg3 as usize;
+            let _flags = arg4 as u32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let conn_idx = fds[fd_idx].offset as usize;
+            let mut out = [0u8; 2048];
+            let n = crate::driver::tcp::recv(conn_idx, &mut out);
+            if n == 0 { return 0; }
+            let actual = n.min(len);
+            smap_disable();
+            for i in 0..actual { core::ptr::write_volatile(buf_ptr.add(i), out[i]); }
+            smap_enable();
+            actual as u64
+        }
+
+        SYS_SHUTDOWN => {
+            let fd_idx = arg1 as usize;
+            let _how = arg2 as u32;
+            let cur = crate::scheduler::CURRENT;
+            let fds = &crate::scheduler::TASKS[cur].fds;
+            if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
+            let conn_idx = fds[fd_idx].offset as usize;
+            crate::driver::tcp::close(conn_idx);
+            let cur_fds = &mut crate::scheduler::TASKS[cur].fds;
+            cur_fds[fd_idx] = crate::scheduler::FdEntry::empty();
+            0
         }
 
         _ => {

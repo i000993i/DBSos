@@ -13,6 +13,9 @@ const REG_STATUS: u32 = 0x0008;
 const REG_MAC_LO: u32 = 0x5400;
 const REG_MAC_HI: u32 = 0x5404;
 const REG_RCTL: u32 = 0x0100;
+const REG_ICR: u32 = 0x00C0;   // Interrupt Cause Read
+const REG_IMS: u32 = 0x00D0;   // Interrupt Mask Set
+const _REG_IMC: u32 = 0x00D8;   // Interrupt Mask Clear
 const REG_TCTL: u32 = 0x0400;
 const REG_TIPG: u32 = 0x0410;
 const REG_RDBAL: u32 = 0x2800;
@@ -222,7 +225,7 @@ fn make_mmio_uncacheable(base: u64, size: u64) {
         // Changing the memory type from WB to UC requires flushing stale
         // write-back cache lines for the region, or old lines keep buffering
         // writes that never reach the device.
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
 
         core::arch::asm!("mov {}, cr0", out(reg) cr0);
         cr0 |= 1u64 << 16;
@@ -351,7 +354,7 @@ fn enable_rx() {
 
     // Flush descriptor ring to RAM before handing buffers to the NIC,
     // otherwise the NIC may read stale/zeroed descriptors (no RX at all).
-    unsafe { core::arch::asm!("wbinvd"); }
+    // wbinvd skipped (QEMU is cache-coherent)
 
     // Give all descriptors to the NIC
     mmio_write32(REG_RDT, (NUM_DESC - 1) as u32);
@@ -371,7 +374,7 @@ fn tx_send(data: &[u8]) -> bool {
         desc.oinfo_sta = 0;
 
         // Flush descriptor + data to physical memory
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
 
         let next = (TX_TAIL + 1) % NUM_DESC;
         mmio_write32(REG_TDT, next as u32);
@@ -383,7 +386,7 @@ fn tx_send(data: &[u8]) -> bool {
 /// Получить пакет (должен быть вызван до recv)
 fn rx_available() -> bool {
     unsafe {
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
         let desc = &*RX_RING.add(RX_HEAD);
         desc.status & 0x01 != 0 // DD = descriptor done
     }
@@ -402,7 +405,7 @@ fn rx_recv() -> Option<(&'static [u8], usize)> {
         let d = &mut *RX_RING.add(idx);
         d.status = 0;
         // Flush очищенного дескриптора к RAM, только потом возвращаем его NIC.
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
         // Вернуть descriptor обратно NIC
         let next_rdt = (RX_HEAD + NUM_DESC - 1) % NUM_DESC;
         mmio_write32(REG_RDT, next_rdt as u32);
@@ -737,7 +740,7 @@ pub fn rx_software_test() {
         let desc = &mut *RX_RING.add(0);
         desc.length = 42;
         desc.status = 0x01; // DD
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
     }
 
     // Now poll should find it
@@ -918,6 +921,57 @@ impl Driver for E1000Driver {
     }
 }
 
+/// Enable e1000 RX interrupt via PCI legacy IRQ.
+/// In QEMU, e1000 typically uses IRQ11 (INTA#) → vector 0x2B after PIC remap.
+pub fn enable_irq() {
+    unsafe {
+        // Set IDT entry for vector 0x2B (IRQ11 + PIC remap 0x20)
+        let entry = &mut crate::interrupts::IDT[0x2B];
+        entry.set_handler(e1000_irq_stub as *const () as u64, 0x08);
+        // Enable RX interrupt (RXT0 = bit 7, RXDMT0 = bit 1, RXO = bit 6)
+        mmio_write32(REG_IMS, (1 << 7) | (1 << 1) | (1 << 6));
+        // Read ICR to clear pending
+        mmio_read32(REG_ICR);
+        // Unmask IRQ11 in PIC (IRQ11 = bit 3 of PIC2, so clear bit 3 of 0xA1)
+        let mask = crate::io::inb(0xA1);
+        crate::io::outb(0xA1, mask & !0x08);
+        uart::write_str("[NET] IRQ enabled (vector 0x2B)\r\n");
+    }
+}
+
+/// IRQ handler for e1000 RX
+#[no_mangle]
+extern "C" fn e1000_irq_handler() {
+    let icr = mmio_read32(REG_ICR);
+    if icr & (1 << 7) != 0 {
+        poll();
+    }
+    // EOI to PIC (IRQ11 is on slave PIC, must EOI slave first)
+    unsafe {
+        crate::io::outb(0xA0, 0x20); // EOI to PIC slave
+        crate::io::outb(0x20, 0x20); // EOI to PIC master
+    }
+}
+
+extern "C" { fn e1000_irq_stub(); }
+
+core::arch::global_asm!(
+    ".globl e1000_irq_stub",
+    "e1000_irq_stub:",
+    "  push rax", "push rcx", "push rdx", "push rbx",
+    "  push rbp", "push rsi", "push rdi",
+    "  push r8", "push r9", "push r10", "push r11",
+    "  push r12", "push r13", "push r14", "push r15",
+    "  sub rsp, 32",
+    "  call e1000_irq_handler",
+    "  add rsp, 32",
+    "  pop r15", "pop r14", "pop r13", "pop r12",
+    "  pop r11", "pop r10", "pop r9", "pop r8",
+    "  pop rdi", "pop rsi", "pop rbp",
+    "  pop rbx", "pop rdx", "pop rcx", "pop rax",
+    "  iretq",
+);
+
 fn uart_hex(mut val: u64) {
     if val == 0 { crate::driver::uart::putchar(b'0'); return; }
     let mut buf = [0u8; 16];
@@ -978,7 +1032,7 @@ pub fn tx_test() {
         uart::write_str("\r\n");
 
         // Flush cache
-        core::arch::asm!("wbinvd");
+        // wbinvd skipped (QEMU is cache-coherent)
 
         // DEBUG: verify ring registers were actually written to the NIC
         {

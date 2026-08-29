@@ -17,7 +17,7 @@ fn cwd_init() {
     }
 }
 
-fn cwd_get() -> &'static [u8] {
+pub fn cwd_get_public() -> &'static [u8] {
     unsafe {
         let ptr = core::ptr::addr_of_mut!(CWD) as *const u8;
         let len = core::slice::from_raw_parts(ptr, 128)
@@ -29,6 +29,8 @@ fn cwd_get() -> &'static [u8] {
 }
 
 const CWD_SIZE: usize = 256;
+
+pub fn cwd_set_public(path: &[u8]) { cwd_set(path); }
 
 fn cwd_set(path: &[u8]) {
     unsafe {
@@ -46,7 +48,7 @@ fn build_path<'a>(path: &[u8], buf: &'a mut [u8]) -> &'a mut [u8] {
         buf[len] = 0;
         &mut buf[..len + 1]
     } else {
-        let cwd = cwd_get();
+        let cwd = cwd_get_public();
         let cwd_len = cwd.len().min(buf.len() - path.len() - 2);
         buf[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
         if cwd_len > 1 {
@@ -135,11 +137,17 @@ fn cmd_help() {
     w("  echo TEXT   - print text\r\n");
     w("  tcp IP PORT TEXT - TCP connect + send\r\n");
     w("  dhcp - get config via DHCP\r\n");
+    w("  dns HOSTNAME - DNS lookup\r\n");
+    w("  wget URL [FILE] - download file via HTTP\r\n");
+    w("  pkg install|remove|list|update - package manager\r\n");
+    w("  gui    - start graphical desktop\r\n");
+    w("  script PATH  - run shell script (.sh)\r\n");
+    w("  exit | poweroff | reboot\r\n");
     w("  dns HOSTNAME - resolve A record\r\n");
 }
 
 fn cmd_pwd() {
-    let cwd = cwd_get();
+    let cwd = cwd_get_public();
     if cwd.len() == 0 || (cwd.len() == 1 && cwd[0] == b'/') {
         w("/");
     } else {
@@ -547,7 +555,7 @@ pub fn run() {
         tcp::pump();
         // Show prompt with cwd
         w("\r\n");
-        let cwd = cwd_get();
+        let cwd = cwd_get_public();
         if cwd.len() <= 1 {
             w("DBSos:/ > ");
         } else {
@@ -615,6 +623,37 @@ pub fn run() {
         else if cmd == b"tcp" { cmd_tcp(arg); }
         else if cmd == b"reboot" { w("Rebooting...\r\n"); crate::acpi::reboot(); }
         else if cmd == b"poweroff" { w("Shutting down...\r\n"); crate::acpi::shutdown(); }
+        else if cmd == b"pkg" {
+            crate::pkg::pkg_main(arg);
+        }
+        else if cmd == b"wget" {
+            if arg.len() > 0 {
+                // wget URL [FILE]
+                let space = arg.iter().position(|&c| c == b' ');
+                match space {
+                    Some(s) => {
+                        let url = &arg[..s];
+                        let file = &arg[s + 1..];
+                        let file_len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+                        crate::wget::wget(url, &file[..file_len]);
+                    }
+                    None => { crate::wget::wget(arg, b""); }
+                }
+            } else {
+                w("Usage: wget URL [FILE]\r\n");
+            }
+        }
+        else if cmd == b"gui" {
+            crate::gui::run();
+        }
+        else if cmd == b"script" {
+            if arg.len() > 0 {
+                let code = crate::script::run_script(arg);
+                w("script exit: "); dec(code as u64); w("\r\n");
+            } else {
+                w("Usage: script PATH\r\n");
+            }
+        }
         else if cmd == b"nvme" { cmd_nvme(&buf); }
         else {
             w("Unknown command: ");
@@ -623,4 +662,24 @@ pub fn run() {
             w("\r\nType 'help' for available commands.\r\n");
         }
     }
+}
+
+// ── Публичные функции для модуля script ────────────────────────────
+
+pub fn print_str_pub(s: &[u8]) {
+    let st = core::str::from_utf8(s).unwrap_or("<binary>");
+    w(st);
+}
+
+pub fn cmd_help_pub() { cmd_help(); }
+pub fn cmd_mem_pub() { cmd_mem(); }
+pub fn cmd_info_pub() { cmd_info(); }
+pub fn cmd_time_pub() { cmd_time(); }
+pub fn cmd_ping_pub() { cmd_ping(); }
+pub fn cmd_dhcp_pub() { cmd_dhcp(); }
+
+pub fn cd_pub(arg: &[u8]) { cmd_cd(arg); }
+
+pub fn ls_pub(path: &[u8]) {
+    crate::fs_server::ls(path);
 }

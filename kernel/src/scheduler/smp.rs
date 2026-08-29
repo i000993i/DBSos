@@ -26,6 +26,7 @@ const W_PML4: usize = 0x188;  // u64
 const W_STACK: usize = 0x190; // u64
 const W_APIC: usize = 0x198;  // u64
 const W_ENTRY: usize = 0x1A0; // u64
+const W_CONSUMED: usize = 0x1A8; // u64: 1 once the AP has read the workspace
 
 // Reserved low-memory regions (below 1 MB, identity-mapped).
 const PG_PML4: u64 = 0x5000;
@@ -35,7 +36,7 @@ const PG_PT: u64 = 0x5300;
 const AP0_GDT: u64 = 0x7000;
 const AP1_GDT: u64 = 0x7200;
 const AP0_STACK: u64 = 0x9000;
-const AP1_STACK: u64 = 0x10000;
+const AP1_STACK: u64 = 0x20000;
 
 const LAPIC_HH_BASE: u64 = 0xFFFF_FFFF_FEE0_0000;
 const ICR: u32 = 0x300;
@@ -119,15 +120,17 @@ core::arch::global_asm!(
     "  mov eax, cr0",
     "  or eax, 0x80000000",          // PG
     "  mov cr0, eax",
-    "  ap_trace 'I'",               // paging enabled (still compat mode)
-    ".byte 0x6A, 0x08",             // push 0x08 (64-bit code selector)
-    ".byte 0x68",                   // pushl imm32
-    ".long (_smp_64 - _smp_start) + 0x8000", // absolute 32-bit target in low RAM
-    ".byte 0xCB",                   // retf: pop EIP32, pop CS16 -> long mode
+    // Enter long mode with an IMMEDIATE far jump, exactly like Linux/xv6:
+    // the first instruction after enabling paging must be the mode switch so
+    // the TCG translator (and real silicon) refetch in 64-bit mode cleanly.
+    ".byte 0xEA",                   // ljmpl: imm32 offset, then imm16 selector
+    ".long (_smp_64 - _smp_start) + 0x8000", // absolute 64-bit target in low RAM
+    ".word 0x0008",                 // CS = 0x08 (64-bit code, L=1)
 
     // ---- 64-bit long mode ----
     ".code64",
     "_smp_64:",
+    "  ap_trace 'J'",               // paging on + long mode reached via the far jump
     "  ap_trace 'D'",
     "  mov ax, 0x10",
     "  mov ds, ax",
@@ -142,6 +145,8 @@ core::arch::global_asm!(
     "  mov rsi, qword ptr [0x7998]", // W_APIC
     "  mov rdx, rsp",
     "  mov rax, qword ptr [0x79A0]", // W_ENTRY
+    "  mov rbx, 1",
+    "  mov qword ptr [0x79A8], rbx", // W_CONSUMED=1: AP finished reading workspace
     "  mov cr3, rdi",               // adopt BSP address space
     "  call rax",
     "loop_here:",
@@ -183,7 +188,7 @@ unsafe fn build_ap_page_tables() {
     // LAPIC high-half.
     pstore_u64(PG_PML4, 0x1FF * 8, PG_PDPT | 0x3);       // PML4[511]
     pstore_u64(PG_PDPT, 0x1FF * 8, PG_PD | 0x3);         // PDPT[511]
-    pstore_u64(PG_PD, 0x6F0 * 8, PG_PT | 0x3);           // PD[0x6F0]
+    pstore_u64(PG_PD, 0x1F7 * 8, PG_PT | 0x3);           // PD[0x1F7]: FEE00000 >> 21 = 0x1F7
     pstore_u64(PG_PT, 0x000, 0xFEE00000 | 0x13);         // PT[0]: LAPIC
 }
 
@@ -278,6 +283,7 @@ unsafe fn prepare_trampoline(ap_index: usize, apic_id: u32) {
     pstore_parts(W_BASE, W_LGDT + 2, gdt_base);
     pstore_u16(W_BASE, W_LIDT, 0);
     pstore_parts(W_BASE, W_LIDT + 2, 0);
+    pstore_u64(W_BASE, W_CONSUMED, 0); // reset AP-consumed flag before launch
     crate::driver::uart::write_str("[SMP] descriptors ok\r\n");
     // Dump the GDTR pseudo-descriptor the AP loads via lgdt [0x7960]:
     // u16 limit + u64 base.
@@ -302,12 +308,50 @@ unsafe fn prepare_trampoline(ap_index: usize, apic_id: u32) {
     crate::driver::uart::write_str("[SMP] constants ok\r\n");
 }
 
+/// The AP trampoline switches CR3 to the BSP address space while still executing
+/// from TRAMP_PHYS (0x8000) with its stacks in low RAM (AP0 0x9000-0x19000,
+/// AP1 0x20000-0x30000). Those instructions and stack writes must resolve in
+/// the BSP page tables, so make sure the kernel's own PML4 identity-maps the
+/// low 2MB. Limine usually maps this already; otherwise create a writable 2MB
+/// identity mapping here.
+unsafe fn ensure_bsp_low_identity() {
+    use crate::vm::{identity_map_2mb, KERNEL_PML4, PTE_WRITABLE, virt_to_phys};
+    let pml4 = KERNEL_PML4 as *mut u64;
+    if virt_to_phys(pml4, 0x18000) != 0 {
+        crate::driver::uart::write_str("[SMP] low 2MB already mapped in BSP PML4\r\n");
+        return;
+    }
+    if identity_map_2mb(pml4, 0, 0x200000, PTE_WRITABLE) {
+        crate::driver::uart::write_str("[SMP] low 2MB identity-mapped (RW)\r\n");
+    } else {
+        crate::driver::uart::write_str("[SMP] WARN: could not map low 2MB\r\n");
+    }
+}
+
 fn low_delay() {
     let mut i = 0;
     while i < 5_000_000 {
         i += 1;
         unsafe { asm!("pause"); }
     }
+}
+
+/// The trampoline workspace is shared by all APs. Before reusing it for the
+/// next CPU we must wait until the just-launched AP has read every field (it
+/// sets W_CONSUMED right before switching CR3). Bounded poll so a crash in the
+/// trampoline cannot hang the BSP forever.
+fn wait_consumed() -> bool {
+    let flag = (W_BASE + W_CONSUMED as u64) as *mut u64;
+    let mut spins: u64 = 0;
+    while unsafe { flag.read_volatile() } != 1 {
+        spins += 1;
+        if spins >= 200_000_000 {
+            return false;
+        }
+        unsafe { asm!("pause"); }
+    }
+    unsafe { flag.write_volatile(0); }
+    true
 }
 
 unsafe fn lapic_read(offset: u32) -> u32 {
@@ -404,6 +448,24 @@ pub fn init() {
         }
         build_ap_page_tables();
         crate::driver::uart::write_str("[SMP] page tables ok\r\n");
+        ensure_bsp_low_identity();
+        {
+            crate::driver::uart::write_str("[SMP] mini PT: PML4[0]=");
+            uart_hex(((PG_PML4 + 0x000) as *const u64).read_volatile());
+            crate::driver::uart::write_str(" PML4[511]=");
+            uart_hex(((PG_PML4 + 0x1FF * 8) as *const u64).read_volatile());
+            crate::driver::uart::write_str("\r\n[SMP] mini PT: PDPT[0]=");
+            uart_hex(((PG_PDPT + 0x000) as *const u64).read_volatile());
+            crate::driver::uart::write_str(" PDPT[511]=");
+            uart_hex(((PG_PDPT + 0x1FF * 8) as *const u64).read_volatile());
+            crate::driver::uart::write_str("\r\n[SMP] mini PT: PD[0]=");
+            uart_hex(((PG_PD + 0x000) as *const u64).read_volatile());
+            crate::driver::uart::write_str(" PD[0x1F7]=");
+            uart_hex(((PG_PD + 0x1F7 * 8) as *const u64).read_volatile());
+            crate::driver::uart::write_str(" PT[0]=");
+            uart_hex(((PG_PT + 0x000) as *const u64).read_volatile());
+            crate::driver::uart::write_str("\r\n");
+        }
 
         let max = ncpu.min(3); // two AP slots reserved
         for cpu in 1..max {
@@ -419,6 +481,12 @@ pub fn init() {
             uart_dec(apic_id as u64);
             crate::driver::uart::write_str(" ...\r\n");
             send_init_sipi(apic_id);
+            if !wait_consumed() {
+                crate::driver::uart::write_str(
+                    "[SMP] WARN: AP did not consume workspace in time, stopping\r\n",
+                );
+                break;
+            }
         }
         crate::driver::uart::write_str("[SMP] bring-up done\r\n");
     }

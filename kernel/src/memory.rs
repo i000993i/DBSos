@@ -179,6 +179,19 @@ pub fn free_count() -> usize {
     unsafe { (*&raw const ALLOC).free_pages }
 }
 
+pub fn total_pages() -> usize {
+    unsafe { (*&raw const ALLOC).total_pages }
+}
+
+pub fn memset_phys(phys: u64, val: u8, size: usize) {
+    let ptr = phys as *mut u8;
+    unsafe {
+        for i in 0..size {
+            *ptr.add(i) = val;
+        }
+    }
+}
+
 fn bit_test(bitmap: *const u8, bit: usize) -> u8 {
     unsafe { (*bitmap.add(bit >> 3) >> (bit & 7)) & 1 }
 }

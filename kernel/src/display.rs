@@ -64,12 +64,15 @@ pub fn init() {
     uart_dec(unsafe { FB_SIZE as u64 });
     uart::write_str(" bytes\r\n");
 
+    uart::write_str("[GOP] clear_screen...\r\n");
     clear_screen(0x00, 0x00, 0x40); // dark blue
+    uart::write_str("[GOP] clear done\r\n");
     draw_pixel(10, 10, 0xFF, 0x00, 0x00); // red pixel at (10,10)
     rect(50, 50, 100, 60, 0x00, 0xFF, 0x00); // green rect
     draw_char(200, 100, b'H', 0xFF, 0xFF, 0xFF);
     draw_char(210, 100, b'i', 0xFF, 0xFF, 0xFF);
     // Initialize framebuffer console
+    uart::write_str("[GOP] console init...\r\n");
     crate::console::init(
         unsafe { FB_BASE as u64 },
         unsafe { FB_WIDTH as u32 },
@@ -89,6 +92,12 @@ pub fn clear_screen(r: u8, g: u8, b: u8) {
     let base = unsafe { FB_BASE };
     if base.is_null() { return; }
     let is_bgr = unsafe { FB_IS_BGR };
+    // Fast path: use memset for solid color fills
+    if r == g && g == b {
+        let cr = if is_bgr { b } else { r };
+        unsafe { core::ptr::write_bytes(base, cr, h * stride * 4); }
+        return;
+    }
     for y in 0..h {
         for x in 0..w {
             let off = (y * stride + x) * 4;
@@ -160,6 +169,10 @@ pub fn draw_str(x: usize, y: usize, s: &str, r: u8, g: u8, b: u8) {
         if cx + 9 >= unsafe { FB_WIDTH } { break; }
     }
 }
+
+pub fn width() -> u32 { unsafe { FB_WIDTH as u32 } }
+pub fn height() -> u32 { unsafe { FB_HEIGHT as u32 } }
+pub fn framebuffer() -> *mut u8 { unsafe { FB_BASE } }
 
 // 8x8 bitmaps из https://github.com/dhepper/font8x8 (Public Domain)
 static FONT8X8: [[u8; 8]; 128] = [
