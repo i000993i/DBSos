@@ -8,6 +8,11 @@ const KSTACK_PAGES: usize = STACK_SIZE / crate::memory::PAGE_SIZE;
 
 pub fn spawn(entry: extern "C" fn()) -> Option<u64> {
     unsafe {
+        // per-user task limit
+        let cur_uid = TASKS[super::CURRENT].uid;
+        if cur_uid != 0 && super::task_count_for_uid(cur_uid) >= super::MAX_TASKS_PER_USER {
+            return None;
+        }
         let tasks = core::ptr::addr_of!(TASKS);
         let slot = (0..MAX_TASKS).find(|&i| (*tasks)[i].state == TaskState::Free)?;
         let stack = crate::memory::palloc_n(KSTACK_PAGES);
@@ -42,6 +47,12 @@ pub fn spawn(entry: extern "C" fn()) -> Option<u64> {
         if prev.kstack_phys != 0 {
             crate::memory::pfree_n(prev.kstack_phys, KSTACK_PAGES);
         }
+        // Inherit uid/gid/cwd from current task
+        let cur = super::CURRENT;
+        let cur_uid = super::TASKS[cur].uid;
+        let cur_gid = super::TASKS[cur].gid;
+        let cur_cwd = super::TASKS[cur].cwd;
+        let cur_cwd_len = super::TASKS[cur].cwd_len;
         TASKS[slot] = Task {
             state: TaskState::Ready,
             stack_base: stack as *mut u8,
@@ -56,6 +67,8 @@ pub fn spawn(entry: extern "C" fn()) -> Option<u64> {
             fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
             vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
             vma_count: 0,
+            uid: cur_uid, gid: cur_gid,
+            cwd: cur_cwd, cwd_len: cur_cwd_len,
         };
         Some(id)
     }
@@ -65,6 +78,10 @@ pub unsafe fn spawn_user(entry: u64, user_rsp: u64,
     pml4: *mut u64, gdt_phys: u64, tss_phys: u64,
     code_phys: u64, user_stack_phys: u64) -> Option<u64>
 {
+    let cur_uid = TASKS[super::CURRENT].uid;
+    if cur_uid != 0 && super::task_count_for_uid(cur_uid) >= super::MAX_TASKS_PER_USER {
+        return None;
+    }
     let tasks = core::ptr::addr_of!(TASKS);
     let slot = (0..MAX_TASKS).find(|&i| (*tasks)[i].state == TaskState::Free)?;
     let prev = &TASKS[slot];
@@ -100,6 +117,11 @@ pub unsafe fn spawn_user(entry: u64, user_rsp: u64,
     let id = NEXT_ID;
     NEXT_ID += 1;
     let fpu_buf = task::fpu_alloc_buf();
+    let cur = super::CURRENT;
+    let cur_uid = TASKS[cur].uid;
+    let cur_gid = TASKS[cur].gid;
+    let cur_cwd = TASKS[cur].cwd;
+    let cur_cwd_len = TASKS[cur].cwd_len;
     TASKS[slot] = Task {
         state: TaskState::Ready,
         stack_base: kstack as *mut u8,
@@ -113,6 +135,8 @@ pub unsafe fn spawn_user(entry: u64, user_rsp: u64,
         fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
         vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
         vma_count: 0,
+        uid: cur_uid, gid: cur_gid,
+        cwd: cur_cwd, cwd_len: cur_cwd_len,
     };
     Some(id)
 }

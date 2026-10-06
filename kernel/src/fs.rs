@@ -703,9 +703,8 @@ pub fn ls_path(path: &[u8]) {
     };
     let name = resolve_name(path);
     if !name.is_empty() {
-        if let Some((_, _, _, attr)) = find_in_dir(dir_cluster, name) {
+        if let Some((sub_cluster, _, _, attr)) = find_in_dir(dir_cluster, name) {
             if attr & 0x10 != 0 {
-                let sub_cluster = find_in_dir(dir_cluster, name).unwrap().0;
                 if sub_cluster == 0 { uart::write_str("[FS] listing root not supported via path\r\n"); return; }
                 list_directory(sub_cluster);
             } else {

@@ -12,6 +12,26 @@ static mut FB_HEIGHT: usize = 0;
 static mut FB_STRIDE: usize = 0;
 static mut FB_IS_BGR: bool = true;
 
+// Double buffering
+static mut BACK_BUF: *mut u8 = core::ptr::null_mut();
+
+// GOP режимы, перечисленные до ExitBootServices (после EBS смена невозможна —
+// boot services недоступны; список для `display` и будущего выбора при загрузке).
+const MAX_GOP_MODES: usize = 16;
+static mut GOP_MODES: [(u32, u32); MAX_GOP_MODES] = [(0, 0); MAX_GOP_MODES];
+static mut GOP_NMODES: usize = 0;
+
+pub fn mode_count() -> usize { unsafe { GOP_NMODES } }
+pub fn mode_info(i: usize) -> Option<(u32, u32)> {
+    unsafe {
+        if i < GOP_NMODES { Some(GOP_MODES[i]) } else { None }
+    }
+}
+
+// Dirty region tracking — only copy changed rows in present()
+static mut DIRTY_MIN_Y: i32 = -1;
+static mut DIRTY_MAX_Y: i32 = -1;
+
 pub fn init() {
     let handles = match boot::locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>()) {
         Ok(h) => h,
@@ -26,6 +46,27 @@ pub fn init() {
         Err(_) => { uart::write_str("[GOP] open fail\r\n"); return; }
     };
 
+    // Не фиксируем 1920x1080 — оставляем режим OVMF по умолчанию (800x600/1024x768), окно QEMU можно масштабировать вручную (View→Zoom)
+    // DBS-GR адаптивен к любому размеру через sw()/sh()
+    // Сначала перечисляем все режимы в таблицу (для `display`)
+    unsafe {
+        let mut n = 0usize;
+        for m in gop.modes() {
+            if n >= MAX_GOP_MODES { break; }
+            // Только напрямую рисуемые 32-битные форматы
+            match m.info().pixel_format() {
+                PixelFormat::Rgb | PixelFormat::Bgr => {
+                    let (mw, mh) = m.info().resolution();
+                    GOP_MODES[n] = (mw as u32, mh as u32);
+                    n += 1;
+                }
+                _ => {}
+            }
+        }
+        GOP_NMODES = n;
+    }
+    uart::write_str("[GOP] modes="); uart_dec(unsafe { GOP_NMODES as u64 });
+    uart::write_str("\r\n");
     let info = gop.current_mode_info();
     let (w, h) = info.resolution();
     let stride = info.stride();
@@ -89,13 +130,15 @@ pub fn clear_screen(r: u8, g: u8, b: u8) {
     let w = unsafe { FB_WIDTH };
     let h = unsafe { FB_HEIGHT };
     let stride = unsafe { FB_STRIDE };
-    let base = unsafe { FB_BASE };
+    let base = framebuffer();
     if base.is_null() { return; }
     let is_bgr = unsafe { FB_IS_BGR };
-    // Fast path: use memset for solid color fills
+    let total = h * stride * 4;
+    let fb_sz = unsafe { FB_SIZE };
+    if total > fb_sz { return; } // safety: don't write beyond framebuffer
     if r == g && g == b {
         let cr = if is_bgr { b } else { r };
-        unsafe { core::ptr::write_bytes(base, cr, h * stride * 4); }
+        unsafe { core::ptr::write_bytes(base, cr, total); }
         return;
     }
     for y in 0..h {
@@ -118,7 +161,7 @@ pub fn clear_screen(r: u8, g: u8, b: u8) {
 }
 
 pub fn draw_pixel(x: usize, y: usize, r: u8, g: u8, b: u8) {
-    let base = unsafe { FB_BASE };
+    let base = framebuffer();
     let w = unsafe { FB_WIDTH };
     let h = unsafe { FB_HEIGHT };
     if base.is_null() || x >= w || y >= h { return; }
@@ -139,9 +182,33 @@ pub fn draw_pixel(x: usize, y: usize, r: u8, g: u8, b: u8) {
 }
 
 pub fn rect(x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
-    for dy in 0..h {
-        for dx in 0..w {
-            draw_pixel(x + dx, y + dy, r, g, b);
+    let fb_w = unsafe { FB_WIDTH };
+    let fb_h = unsafe { FB_HEIGHT };
+    if x >= fb_w || y >= fb_h { return; }
+    let rw = (w).min(fb_w - x);
+    let rh = (h).min(fb_h - y);
+    if rw == 0 || rh == 0 { return; }
+    let base = framebuffer();
+    if base.is_null() { return; }
+    let stride = unsafe { FB_STRIDE };
+    let is_bgr = unsafe { FB_IS_BGR };
+    for dy in 0..rh {
+        let py = y + dy;
+        let off_base = (py * stride + x) * 4;
+        for dx in 0..rw {
+            let off = off_base + dx * 4;
+            unsafe {
+                if is_bgr {
+                    *base.add(off) = b;
+                    *base.add(off + 1) = g;
+                    *base.add(off + 2) = r;
+                } else {
+                    *base.add(off) = r;
+                    *base.add(off + 1) = g;
+                    *base.add(off + 2) = b;
+                }
+                *base.add(off + 3) = 0;
+            }
         }
     }
 }
@@ -172,7 +239,156 @@ pub fn draw_str(x: usize, y: usize, s: &str, r: u8, g: u8, b: u8) {
 
 pub fn width() -> u32 { unsafe { FB_WIDTH as u32 } }
 pub fn height() -> u32 { unsafe { FB_HEIGHT as u32 } }
-pub fn framebuffer() -> *mut u8 { unsafe { FB_BASE } }
+pub fn stride() -> u32 { unsafe { FB_STRIDE as u32 } }
+pub fn is_bgr() -> bool { unsafe { FB_IS_BGR } }
+pub fn fb_phys() -> u64 { unsafe { FB_BASE as u64 } }
+
+pub fn get_glyph(ch: u8) -> &'static [u8; 8] {
+    if ch >= 128 { return &FONT8X8[0]; }
+    &FONT8X8[ch as usize]
+}
+
+/// Returns pointer to the back buffer (all drawing goes here)
+pub fn framebuffer() -> *mut u8 {
+    unsafe {
+        if !BACK_BUF.is_null() { BACK_BUF } else { FB_BASE }
+    }
+}
+
+/// Returns pointer to the real framebuffer (for direct reads like alpha blending)
+pub fn real_framebuffer() -> *mut u8 { unsafe { FB_BASE } }
+
+/// Allocate back buffer and redirect all drawing to it
+pub unsafe fn init_double_buffer() {
+    let sz = FB_SIZE;
+    if sz == 0 || !BACK_BUF.is_null() { return; }
+    let buf = crate::heap::kmalloc(sz);
+    if buf.is_null() {
+        uart::write_str("[GOP] double buffer alloc failed\r\n");
+        return;
+    }
+    core::ptr::copy_nonoverlapping(FB_BASE, buf, sz);
+    BACK_BUF = buf;
+    uart::write_str("[GOP] double buffer ready\r\n");
+}
+
+/// Copy back buffer to real framebuffer (eliminates flicker)
+/// Only copies rows that were marked dirty — 10-100x faster than full copy
+/// IRQ-safe: сохраняет IF и восстанавливает, а не слепой sti.
+pub unsafe fn present() {
+    if BACK_BUF.is_null() || FB_BASE.is_null() { return; }
+    if DIRTY_MIN_Y < 0 { return; } // nothing dirty
+    let min_y = DIRTY_MIN_Y.max(0) as usize;
+    let max_y = (DIRTY_MAX_Y + 1).min(FB_HEIGHT as i32) as usize;
+    if min_y >= max_y { reset_dirty(); return; }
+    let stride = FB_STRIDE;
+    let row_bytes = stride * 4;
+    let copy_start = min_y * row_bytes;
+    let copy_count = (max_y - min_y) * row_bytes;
+    // Сохранить IF, запретить IRQ на время копии (защита back buffer)
+    let flags: u64;
+    core::arch::asm!("pushfq; pop {}", out(reg) flags);
+    core::arch::asm!("cli");
+    // Clamp на случай гонки с изменением FB_SIZE
+    let total = FB_HEIGHT * FB_STRIDE * 4;
+    if copy_start + copy_count <= total {
+        core::ptr::copy_nonoverlapping(
+            BACK_BUF.add(copy_start),
+            FB_BASE.add(copy_start),
+            copy_count,
+        );
+    }
+    reset_dirty();
+    if flags & (1 << 9) != 0 {
+        core::arch::asm!("sti");
+    }
+}
+
+pub fn mark_dirty(_x: i32, y: i32, _w: u32, h: u32) {
+    if h == 0 { return; }
+    unsafe {
+        // Clamp к высоте экрана, чтобы present() никогда не копировал мусор
+        let hgt = FB_HEIGHT as i32;
+        if hgt <= 0 { return; }
+        let mut y1 = y.max(0).min(hgt - 1);
+        let mut y2 = (y + h as i32 - 1).max(0).min(hgt - 1);
+        if y2 < y1 { core::mem::swap(&mut y1, &mut y2); }
+        if DIRTY_MIN_Y < 0 || y1 < DIRTY_MIN_Y { DIRTY_MIN_Y = y1; }
+        if DIRTY_MAX_Y < 0 || y2 > DIRTY_MAX_Y { DIRTY_MAX_Y = y2; }
+    }
+}
+
+pub fn reset_dirty() {
+    unsafe { DIRTY_MIN_Y = -1; DIRTY_MAX_Y = -1; }
+}
+
+// ── Per-layer dirty tracking ────────────────────────────────────
+
+const MAX_LAYERS: usize = 8;
+
+#[derive(Copy, Clone)]
+struct LayerDirty {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    dirty: bool,
+}
+
+static mut LAYERS: [LayerDirty; MAX_LAYERS] = [LayerDirty {
+    min_x: 0, min_y: 0, max_x: 0, max_y: 0, dirty: false,
+}; MAX_LAYERS];
+
+/// Mark a specific layer as dirty with a bounding box
+pub fn mark_layer_dirty(layer: usize, x: i32, y: i32, w: u32, h: u32) {
+    if layer >= MAX_LAYERS { return; }
+    unsafe {
+        let ld = &mut LAYERS[layer];
+        let x2 = x + w as i32 - 1;
+        let y2 = y + h as i32 - 1;
+        if !ld.dirty {
+            ld.min_x = x; ld.min_y = y;
+            ld.max_x = x2; ld.max_y = y2;
+            ld.dirty = true;
+        } else {
+            if x < ld.min_x { ld.min_x = x; }
+            if y < ld.min_y { ld.min_y = y; }
+            if x2 > ld.max_x { ld.max_x = x2; }
+            if y2 > ld.max_y { ld.max_y = y2; }
+        }
+        // Also mark global dirty
+        mark_dirty(x, y, w, h);
+    }
+}
+
+/// Check if a specific layer is dirty
+pub fn is_layer_dirty(layer: usize) -> bool {
+    if layer >= MAX_LAYERS { return false; }
+    unsafe { LAYERS[layer].dirty }
+}
+
+/// Get dirty bounds for a layer
+pub fn layer_dirty_bounds(layer: usize) -> Option<(i32, i32, i32, i32)> {
+    if layer >= MAX_LAYERS { return None; }
+    unsafe {
+        let ld = &LAYERS[layer];
+        if ld.dirty { Some((ld.min_x, ld.min_y, ld.max_x, ld.max_y)) }
+        else { None }
+    }
+}
+
+/// Reset dirty state for a specific layer
+pub fn reset_layer_dirty(layer: usize) {
+    if layer >= MAX_LAYERS { return; }
+    unsafe { LAYERS[layer].dirty = false; }
+}
+
+/// Reset all layers dirty state
+pub fn reset_all_layers() {
+    for i in 0..MAX_LAYERS {
+        reset_layer_dirty(i);
+    }
+}
 
 // 8x8 bitmaps из https://github.com/dhepper/font8x8 (Public Domain)
 static FONT8X8: [[u8; 8]; 128] = [

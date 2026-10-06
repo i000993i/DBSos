@@ -46,29 +46,48 @@ const USER_STACK_SIZE: u64 = 0x1000;
 // From scheduler
 use crate::scheduler;
 
+#[allow(unused_unsafe)]
 pub fn load_and_spawn(name: &[u8]) -> u64 {
-    // Read ELF file
-    let mut elf_buf = [0u8; 4096];
-    let _file_size = match crate::fs::read_file_path(name, &mut elf_buf) {
-        Some(sz) => sz,
-        None => { uart_print("[ELF] file not found or too large\r\n"); return 0; }
-    };
+    // Read ELF file через VFS (FAT+tmpfs), полный размер до 512KB.
+    // Раньше было 4KB на стеке через legacy fs — большие бинарники не грузились.
+    if name.is_empty() || name.len() > 127 { return 0; }
+    let fd = crate::vfs::open(name, 0);
+    if fd < 0 { uart_print("[ELF] not found\r\n"); return 0; }
+    let mut st = crate::vfs::StatInfo { size: 0, is_dir: false, cluster: 0 };
+    if crate::vfs::stat(name, &mut st) != 0 { crate::vfs::close(fd); return 0; }
+    if st.is_dir { crate::vfs::close(fd); return 0; }
+    let file_size = st.size as usize;
+    if file_size < 64 || file_size > 512 * 1024 { crate::vfs::close(fd); uart_print("[ELF] bad size\r\n"); return 0; }
+    let elf_ptr = unsafe { crate::heap::kmalloc(file_size) };
+    if elf_ptr.is_null() { crate::vfs::close(fd); return 0; }
+    let elf_buf = unsafe { core::slice::from_raw_parts_mut(elf_ptr, file_size) };
+    let n = crate::vfs::read(fd, elf_buf);
+    crate::vfs::close(fd);
+    if n <= 0 || (n as usize) < 64 { unsafe { crate::heap::kfree(elf_ptr); } return 0; }
+    let file_size = n as usize;
+    // дальше работаем с elf_buf[..file_size]; освободить перед return'ами ниже!
+    macro_rules! done { ($v:expr) => {{ unsafe { crate::heap::kfree(elf_ptr); } return $v; }} }
 
     let ehdr = unsafe { &*(elf_buf.as_ptr() as *const Elf64Ehdr) };
 
     if &ehdr.ident[0..4] != b"\x7fELF" || ehdr.ident[4] != 2 || ehdr.ident[5] != 1 {
         uart_print("[ELF] bad magic/class/endian\r\n");
-        return 0;
+        done!(0);
     }
     if ehdr.machine != 62 || (ehdr.type_ != 2 && ehdr.type_ != 3) {
         uart_print("[ELF] not x86_64 exe/dyn\r\n");
-        return 0;
+        done!(0);
     }
 
     let entry = ehdr.entry;
     let phoff = ehdr.phoff as usize;
     let phnum = ehdr.phnum as usize;
     let phentsize = ehdr.phentsize as usize;
+    // Валидация program headers: всё должно лежать внутри файла
+    if phentsize != 56 || phnum == 0 || phnum > 32 { uart_print("[ELF] bad phnum\r\n"); done!(0); }
+    if phoff.checked_add(phnum * phentsize).map_or(true, |e| e > file_size) {
+        uart_print("[ELF] phdr out of file\r\n"); done!(0);
+    }
 
     uart_print("[ELF] entry=0x");
     uart_hex(entry);
@@ -79,20 +98,20 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
     while i > 0 { i -= 1; crate::driver::uart::putchar(b[i]); }
     uart_print("\r\n");
 
-    let code_phys = match crate::memory::palloc() { 0 => { uart_print("[ELF] alloc failed\r\n"); return 0; } p => p };
-    let stack_phys = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); return 0; } p => p };
-    let gdt_phys = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); crate::memory::pfree(stack_phys); return 0; } p => p };
-    let tss_page = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); crate::memory::pfree(stack_phys); crate::memory::pfree(gdt_phys); return 0; } p => p };
+    let code_phys = match crate::memory::palloc() { 0 => { uart_print("[ELF] alloc failed\r\n"); done!(0); } p => p };
+    let stack_phys = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); done!(0); } p => p };
+    let gdt_phys = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); crate::memory::pfree(stack_phys); done!(0); } p => p };
+    let tss_page = match crate::memory::palloc() { 0 => { crate::memory::pfree(code_phys); crate::memory::pfree(stack_phys); crate::memory::pfree(gdt_phys); done!(0); } p => p };
 
     let pml4 = match unsafe { crate::syscall::prepare_user_pml4() } {
         Some(v) => v,
-        None => { uart_print("[ELF] pml4 failed\r\n"); return 0; }
+        None => { uart_print("[ELF] pml4 failed\r\n"); done!(0); }
     };
 
     unsafe {
         if crate::vm::map_page(pml4, stack_phys, USER_STACK_VIRT,
             crate::vm::PTE_WRITABLE | crate::vm::PTE_USER) != 0 {
-            uart_print("[ELF] stack map failed\r\n"); return 0;
+            uart_print("[ELF] stack map failed\r\n"); done!(0);
         }
     }
 
@@ -104,6 +123,11 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
         let offset = phdr.p_offset as usize;
+        // Сегментные данные должны лежать внутри файла
+        if offset.checked_add(filesz).map_or(true, |e| e > file_size) {
+            uart_print("[ELF] seg out of file\r\n"); done!(0);
+        }
+        if memsz > 64 * 1024 * 1024 { uart_print("[ELF] seg too big\r\n"); done!(0); }
 
         let seg_start = vaddr & !0xFFF;
         let seg_end = (vaddr + memsz as u64 + 0xFFF) & !0xFFF;
@@ -111,7 +135,7 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
 
         for p in 0..num_pages {
             let page_phys = match crate::memory::palloc() {
-                0 => { uart_print("[ELF] page alloc failed\r\n"); return 0; }
+                0 => { uart_print("[ELF] page alloc failed\r\n"); done!(0); }
                 p => p
             };
             let page_virt = seg_start + (p as u64) * 0x1000;
@@ -119,7 +143,7 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
             if phdr.p_flags & PF_W != 0 { flags |= crate::vm::PTE_WRITABLE; }
             unsafe {
                 if crate::vm::map_page(pml4, page_phys, page_virt, flags) != 0 {
-                    uart_print("[ELF] map failed\r\n"); return 0;
+                    uart_print("[ELF] map failed\r\n"); done!(0);
                 }
             }
             // Write segment data directly into the physical page (kernel identity
@@ -162,6 +186,8 @@ pub fn load_and_spawn(name: &[u8]) -> u64 {
     let id = unsafe {
         scheduler::spawn_user(entry, user_rsp, pml4, gdt_phys, tss_page, code_phys, stack_phys)
     };
+    // ELF-буфер больше не нужен (сегменты скопированы в свои страницы)
+    unsafe { crate::heap::kfree(elf_ptr); }
 
     match id {
         Some(tid) => {

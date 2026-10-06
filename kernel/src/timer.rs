@@ -49,6 +49,11 @@ pub fn millis() -> u64 {
     hpet_read(MAIN_CNT) / 10_000 // 10,000 ticks per ms
 }
 
+/// Return nanoseconds since boot (HPET: 100ns resolution = 10 MHz)
+pub fn nanos() -> u64 {
+    hpet_read(MAIN_CNT) * 100 // 100 ns per tick
+}
+
 pub fn ticks() -> u64 {
     hpet_read(MAIN_CNT)
 }

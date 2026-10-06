@@ -22,14 +22,29 @@ static mut RX_BUF: [u8; UDP_BUF] = [0; UDP_BUF];
 
 /// Отправить UDP-датаграмму.
 /// MAC резолвится через ARP (или broadcast для 255.255.255.255).
+/// Внешние IP маршрутизируются через gateway (иначе ARP для 8.8.8.8
+/// никогда не ответит и пакет уйдёт broadcast'ом в никуда).
 pub fn send(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
     let bcast: [u8; 4] = [255, 255, 255, 255];
     let dst_mac = if dst_ip == bcast {
         [0xFF; 6]
+    } else if !in_subnet(&dst_ip) {
+        // Внешний адрес — шлём на MAC шлюза
+        let gw = net::gateway();
+        net::resolve(gw, 2000).unwrap_or([0xFF; 6])
     } else {
         net::resolve(dst_ip, 2000).unwrap_or([0xFF; 6])
     };
     net::send_udp(src_ip, dst_mac, dst_ip, src_port, dst_port, payload)
+}
+
+fn in_subnet(ip: &[u8; 4]) -> bool {
+    let mask = net::netmask();
+    let ours = net::our_ip();
+    for i in 0..4 {
+        if (ip[i] & mask[i]) != (ours[i] & mask[i]) { return false; }
+    }
+    true
 }
 
 /// Входящий IP-пакет с protocol=17 из `net::poll()`.

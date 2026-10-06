@@ -1,0 +1,7 @@
+[package]
+name = "dbs-gr-user"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dbsos-abi = { path = "../../libs/dbsos-abi" }

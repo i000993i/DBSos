@@ -18,7 +18,7 @@ struct Bpb {
     num_fats: u8,
     root_entry_count: u16,   // FAT12/16 only
     _total_sectors_16: u16,   // FAT12/16 only
-    _fat_size_16: u16,        // FAT12/16: sectors per FAT
+    fat_size_16: u16,        // FAT12/16: sectors per FAT
     fat_size_32: u32,        // FAT32: sectors per FAT
     root_cluster: u32,       // FAT32: root dir cluster
     fat_type: FatType,       // FAT12, FAT16, or FAT32
@@ -32,20 +32,106 @@ enum FatType { Fat12, Fat16, Fat32 }
 
 // ── BPB reading helpers ─────────────────────────────────────────
 
-fn read_bpb_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
-    if unsafe { crate::driver::nvme::FS_INIT } {
-        crate::driver::nvme::read_sectors(lba, 1, buf.as_mut_ptr())
-    } else {
-        crate::driver::ahci::read_sectors(lba, 1, buf.as_mut_ptr())
+fn part_base() -> u64 {
+    match crate::block::active() {
+        crate::block::Backend::Nvme => crate::driver::nvme::part_lba(),
+        crate::block::Backend::Ahci => crate::driver::ahci::part_lba(),
+        crate::block::Backend::Ide => {
+            // IDE: MBR в LBA0, партиция — разбираем один раз и кэшируем
+            ide_part_lba()
+        }
+        crate::block::Backend::None => {
+            if unsafe { crate::driver::nvme::FS_INIT } {
+                crate::driver::nvme::part_lba()
+            } else if crate::driver::ahci::is_ready() {
+                crate::driver::ahci::part_lba()
+            } else {
+                ide_part_lba()
+            }
+        }
     }
 }
 
-fn write_bpb_sector(lba: u64, buf: &[u8; 512]) -> bool {
-    if unsafe { crate::driver::nvme::FS_INIT } {
-        crate::driver::nvme::write_fat_sector(lba, buf)
-    } else {
-        crate::driver::ahci::write_fat_sector(lba, buf)
+static mut IDE_PART_CACHED: bool = false;
+static mut IDE_PART_LBA: u64 = 0;
+
+fn ide_part_lba() -> u64 {
+    unsafe {
+        if IDE_PART_CACHED { return IDE_PART_LBA; }
     }
+    // Прочитать MBR через block-слой напрямую (IDE ATA LBA0)
+    let devs = crate::driver::ide::devices();
+    let mut found: Option<crate::driver::ide::IdeDevice> = None;
+    for d in devs { if d.present && !d.atapi { found = Some(d); break; } }
+    let dev = match found { Some(d) => d, None => return 0 };
+    let phys = crate::memory::palloc();
+    if phys == 0 { return 0; }
+    let ok = crate::driver::ide::ata_read(&dev, 0, 1, phys as *mut u8);
+    let lba = if ok {
+        let mbr = unsafe { core::slice::from_raw_parts(phys as *const u8, 512) };
+        let sig = (mbr[0x1FE] as u16) | ((mbr[0x1FF] as u16) << 8);
+        if sig != 0xAA55 { 0 }
+        else if mbr[0x1C2] == 0xEE {
+            // GPT на IDE — ищем через общий gpt-парсер
+            ide_gpt_lba(&dev).unwrap_or(0)
+        } else {
+            (mbr[0x1C6] as u64) | ((mbr[0x1C7] as u64) << 8)
+                | ((mbr[0x1C8] as u64) << 16) | ((mbr[0x1C9] as u64) << 24)
+        }
+    } else { 0 };
+    crate::memory::pfree(phys);
+    unsafe { IDE_PART_LBA = lba; IDE_PART_CACHED = true; }
+    lba
+}
+
+fn ide_gpt_lba(dev: &crate::driver::ide::IdeDevice) -> Option<u64> {
+    let phys = crate::memory::palloc();
+    if phys == 0 { return None; }
+    if !crate::driver::ide::ata_read(dev, 1, 1, phys as *mut u8) {
+        crate::memory::pfree(phys);
+        return None;
+    }
+    let res = {
+        let hdr = unsafe { &*(phys as *const [u8; 512]) };
+        crate::gpt::parse_header(hdr)
+    };
+    crate::memory::pfree(phys);
+    let (entry_lba, entry_num, entry_size) = res?;
+    // Читаем первую запись партиций
+    let buf = crate::memory::palloc();
+    if buf == 0 { return None; }
+    if !crate::driver::ide::ata_read(dev, entry_lba as u32, 1, buf as *mut u8) {
+        crate::memory::pfree(buf);
+        return None;
+    }
+    let out = {
+        let flat = unsafe { core::slice::from_raw_parts(buf as *const u8, 512) };
+        crate::gpt::first_partition_lba(flat, entry_num, entry_size)
+    };
+    crate::memory::pfree(buf);
+    out
+}
+
+fn read_bpb_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
+    // Единый путь: активный backend + part_base. Fallback — прямой перебор.
+    let base = part_base();
+    if crate::block::read_fat_sector(base, lba, buf) { return true; }
+    // Fallback: попробовать каждый backend напрямую (когда probe ещё не выбран)
+    if unsafe { crate::driver::nvme::FS_INIT }
+        && crate::driver::nvme::read_fat_sector(lba, buf) { return true; }
+    if crate::driver::ahci::is_ready()
+        && crate::driver::ahci::read_fat_sector(lba, buf) { return true; }
+    false
+}
+
+fn write_bpb_sector(lba: u64, buf: &[u8; 512]) -> bool {
+    let base = part_base();
+    if crate::block::write_fat_sector(base, lba, buf) { return true; }
+    if unsafe { crate::driver::nvme::FS_INIT }
+        && crate::driver::nvme::write_fat_sector(lba, buf) { return true; }
+    if crate::driver::ahci::is_ready()
+        && crate::driver::ahci::write_fat_sector(lba, buf) { return true; }
+    false
 }
 
 fn le16(buf: &[u8], off: usize) -> u16 {
@@ -136,7 +222,7 @@ fn read_bpb() -> Option<Bpb> {
         num_fats,
         root_entry_count: root_entries,
         _total_sectors_16: tot16,
-        _fat_size_16: fat_sz16,
+        fat_size_16: fat_sz16,
         fat_size_32: fat_sz32,
         root_cluster,
         fat_type,
@@ -144,6 +230,16 @@ fn read_bpb() -> Option<Bpb> {
         total_clusters,
         _fs_info_sector: fs_info,
     })
+}
+
+/// Sectors per FAT для текущего типа: у FAT12/16 размер лежит в BPB+22,
+/// у FAT32 — в BPB+36. Поле fat_size_32 для FAT12/16 содержит мусор EBPB
+/// (drive number/signature), его использовать нельзя (root улетал на LBA ~2 млрд).
+fn fat_sectors(bpb: &Bpb) -> u64 {
+    match bpb.fat_type {
+        FatType::Fat32 => bpb.fat_size_32 as u64,
+        _ => bpb.fat_size_16 as u64,
+    }
 }
 
 /// Read a FAT entry for a given cluster.
@@ -196,7 +292,7 @@ fn fat_write_entry(bpb: &Bpb, cluster: u32, value: u32) -> bool {
             if !write_bpb_sector(sector, &buf) { return false; }
             // Mirror to second FAT
             if bpb.num_fats > 1 {
-                let s2 = sector + bpb.fat_size_32 as u64;
+                let s2 = sector + fat_sectors(bpb);
                 let _ = write_bpb_sector(s2, &buf);
             }
             true
@@ -210,7 +306,7 @@ fn fat_write_entry(bpb: &Bpb, cluster: u32, value: u32) -> bool {
             write_le16(&mut buf, byte_off, value as u16);
             if !write_bpb_sector(sector, &buf) { return false; }
             if bpb.num_fats > 1 {
-                let s2 = sector + bpb.fat_size_32 as u64;
+                let s2 = sector + fat_sectors(bpb);
                 let _ = write_bpb_sector(s2, &buf);
             }
             true
@@ -225,7 +321,7 @@ fn fat_write_entry(bpb: &Bpb, cluster: u32, value: u32) -> bool {
             write_le32(&mut buf, byte_off, (old & 0xF0000000) | (value & 0x0FFFFFFF));
             if !write_bpb_sector(sector, &buf) { return false; }
             if bpb.num_fats > 1 {
-                let s2 = sector + bpb.fat_size_32 as u64;
+                let s2 = sector + fat_sectors(bpb);
                 let _ = write_bpb_sector(s2, &buf);
             }
             true
@@ -302,128 +398,142 @@ fn free_chain(bpb: &Bpb, start: u32) {
 }
 
 /// Read data from a cluster chain into a buffer.
+/// Корректная версия: intra-смещение только для первого кластера,
+/// дальше — сплошной поток байт через LBA кластеров.
 fn read_chain(bpb: &Bpb, first_cluster: u32, offset: u64, buf: &mut [u8]) -> usize {
+    if buf.is_empty() || first_cluster < 2 { return 0; }
     let bps = bpb.bytes_per_sector as u64;
     let spc = bpb.sectors_per_cluster as u64;
     let cluster_sz = bps * spc;
-    let mut remaining = buf.len();
+    if cluster_sz == 0 { return 0; }
+
+    // Найти стартовый кластер и смещение внутри него
     let mut cluster = first_cluster;
+    let mut skip = offset / cluster_sz;
     let mut iter = 0u32;
-    let mut bytes_read = 0usize;
-
-    // Skip clusters before offset
-    let skip_clusters = offset / cluster_sz;
-    for _ in 0..skip_clusters {
-        if fat_is_eoc(bpb, cluster) || cluster < 2 { return bytes_read; }
+    while skip > 0 {
+        if fat_is_eoc(bpb, cluster) || cluster < 2 { return 0; }
         cluster = fat_read_entry(bpb, cluster);
+        skip -= 1;
+        iter += 1;
+        if iter > 100_000 { return 0; }
     }
-    let intra = (offset % cluster_sz) as usize;
-
-    while remaining > 0 && !fat_is_eoc(bpb, cluster) && cluster >= 2 {
+    let mut intra = (offset % cluster_sz) as usize;
+    let mut out = 0usize;
+    iter = 0;
+    while out < buf.len() {
         iter += 1;
         if iter > 100_000 { break; }
-
+        if fat_is_eoc(bpb, cluster) || cluster < 2 { break; }
         let lba = cluster_to_lba(bpb, cluster);
-        let to_read = remaining.min(cluster_sz as usize - intra);
-        let nsecs = ((to_read + intra + bps as usize - 1) / bps as usize) as u64;
-
-        for s in 0..nsecs {
+        // Сколько байт взять из этого кластера
+        let avail = cluster_sz as usize - intra;
+        let want = (buf.len() - out).min(avail);
+        // Читаем нужные сектора кластера
+        let first_sec = intra / bps as usize;
+        let last_byte = intra + want; // exclusive
+        let last_sec = (last_byte + bps as usize - 1) / bps as usize;
+        for s in first_sec..last_sec {
             let mut sec = [0u8; 512];
-            if !read_bpb_sector(lba + s, &mut sec) { return bytes_read; }
-            let start = if s == 0 { intra } else { 0 };
-            let end = core::cmp::min(start + to_read - bytes_read + intra, 512);
-            if end > start {
-                let n = (end - start).min(remaining);
-                buf[bytes_read..bytes_read + n].copy_from_slice(&sec[start..start + n]);
-                bytes_read += n;
-                remaining -= n;
-            }
-            if remaining == 0 { break; }
+            if !read_bpb_sector(lba + s as u64, &mut sec) { return out; }
+            let sec_start = if s == first_sec { intra % bps as usize } else { 0 };
+            let sec_end_cap = bps as usize;
+            let remaining_in_range = last_byte - (s * bps as usize);
+            let take = remaining_in_range.min(sec_end_cap - sec_start).min(buf.len() - out);
+            if take == 0 { break; }
+            buf[out..out + take].copy_from_slice(&sec[sec_start..sec_start + take]);
+            out += take;
+            if out >= buf.len() { break; }
         }
-
-        if remaining > 0 {
-            cluster = fat_read_entry(bpb, cluster);
-        }
+        intra = 0; // только первый кластер имел смещение
+        if out >= buf.len() { break; }
+        cluster = fat_read_entry(bpb, cluster);
     }
-    bytes_read
+    out
 }
 
 /// Write data to a cluster chain (allocating new clusters as needed).
 fn write_chain(bpb: &Bpb, first_cluster: u32, offset: u64, data: &[u8]) -> usize {
+    if data.is_empty() || first_cluster < 2 { return 0; }
     let bps = bpb.bytes_per_sector as u64;
     let spc = bpb.sectors_per_cluster as u64;
     let cluster_sz = bps * spc;
-    let mut remaining = data.len();
-    let mut data_pos = 0usize;
+    if cluster_sz == 0 { return 0; }
+
+    // Дойти до стартового кластера, доаллоцируя по пути
     let mut cluster = first_cluster;
+    let mut skip = offset / cluster_sz;
     let mut iter = 0u32;
-    let mut written = 0usize;
-
-    // Skip clusters before offset
-    let skip_clusters = offset / cluster_sz;
-    for _ in 0..skip_clusters {
-        if fat_is_eoc(bpb, cluster) || cluster < 2 {
-            // Need to allocate more clusters
-            let new_cl = alloc_cluster(bpb);
-            if new_cl == 0 { return written; }
-            let _ = fat_write_entry(bpb, cluster, new_cl);
-            let _ = fat_write_entry(bpb, new_cl, fat_eoc(bpb));
-            cluster = new_cl;
+    while skip > 0 {
+        iter += 1;
+        if iter > 100_000 { return 0; }
+        let next = fat_read_entry(bpb, cluster);
+        if fat_is_eoc(bpb, next) || next < 2 {
+            let nc = alloc_cluster(bpb);
+            if nc == 0 { return 0; }
+            let _ = fat_write_entry(bpb, nc, fat_eoc(bpb));
+            let _ = fat_write_entry(bpb, cluster, nc);
+            cluster = nc;
         } else {
-            cluster = fat_read_entry(bpb, cluster);
+            cluster = next;
         }
+        skip -= 1;
     }
-    let intra = (offset % cluster_sz) as usize;
-
-    while remaining > 0 {
+    let mut intra = (offset % cluster_sz) as usize;
+    let mut done = 0usize;
+    iter = 0;
+    while done < data.len() {
         iter += 1;
         if iter > 100_000 { break; }
-
-        // Ensure cluster is allocated
-        if fat_is_eoc(bpb, cluster) || cluster < 2 {
-            let new_cl = alloc_cluster(bpb);
-            if new_cl == 0 { break; }
-            if cluster >= 2 && !fat_is_eoc(bpb, cluster) {
-                let _ = fat_write_entry(bpb, cluster, new_cl);
-            }
-            let _ = fat_write_entry(bpb, new_cl, fat_eoc(bpb));
-            cluster = new_cl;
+        if cluster < 2 { break; }
+        if fat_is_eoc(bpb, cluster) {
+            // Текущий — EOC-заглушка пустого файла: превращаем в данные
+            let nc = alloc_cluster(bpb);
+            if nc == 0 { break; }
+            let _ = fat_write_entry(bpb, nc, fat_eoc(bpb));
+            let _ = fat_write_entry(bpb, cluster, nc);
+            cluster = nc;
         }
-
         let lba = cluster_to_lba(bpb, cluster);
-        let start = if written == 0 { intra } else { 0 };
-        let to_write = remaining.min(cluster_sz as usize - start);
-        let nsecs = ((to_write + start + bps as usize - 1) / bps as usize) as u64;
-
-        for s in 0..nsecs {
+        let avail = cluster_sz as usize - intra;
+        let want = (data.len() - done).min(avail);
+        let first_sec = intra / bps as usize;
+        let last_byte = intra + want;
+        let last_sec = (last_byte + bps as usize - 1) / bps as usize;
+        for s in first_sec..last_sec {
             let mut sec = [0u8; 512];
-            if !read_bpb_sector(lba + s, &mut sec) { return written; }
-            let sec_start = if s == 0 { start } else { 0 };
-            let n = core::cmp::min(to_write - written + if s == 0 { 0 } else { 0 }, 512 - sec_start);
-            if n > 0 {
-                sec[sec_start..sec_start + n].copy_from_slice(&data[data_pos..data_pos + n]);
-                let _ = write_bpb_sector(lba + s, &sec);
-                data_pos += n;
-                written += n;
-                remaining -= n;
-            }
-            if remaining == 0 { break; }
+            if !read_bpb_sector(lba + s as u64, &mut sec) { return done; }
+            let sec_start = if s == first_sec { intra % bps as usize } else { 0 };
+            let sec_off_in_range = s * bps as usize;
+            // Сколько байт этого сектора входит в [intra, intra+want)
+            let range_start = intra.max(sec_off_in_range);
+            let range_end = (intra + want).min(sec_off_in_range + bps as usize);
+            if range_end <= range_start { continue; }
+            let take = (range_end - range_start).min(data.len() - done);
+            let dst_off = sec_start + (range_start - sec_off_in_range.max(intra).min(range_start));
+            // Проще: позиция в секторе = range_start - s*512
+            let sec_pos = range_start - sec_off_in_range;
+            sec[sec_pos..sec_pos + take].copy_from_slice(&data[done..done + take]);
+            let _ = write_bpb_sector(lba + s as u64, &sec);
+            done += take;
+            if done >= data.len() { break; }
+            let _ = dst_off;
         }
-
-        if remaining > 0 {
-            let next = fat_read_entry(bpb, cluster);
-            if fat_is_eoc(bpb, next) || next < 2 {
-                let new_cl = alloc_cluster(bpb);
-                if new_cl == 0 { break; }
-                let _ = fat_write_entry(bpb, cluster, new_cl);
-                let _ = fat_write_entry(bpb, new_cl, fat_eoc(bpb));
-                cluster = new_cl;
-            } else {
-                cluster = next;
-            }
+        intra = 0;
+        if done >= data.len() { break; }
+        // Переход к следующему кластеру с аллокацией
+        let next = fat_read_entry(bpb, cluster);
+        if fat_is_eoc(bpb, next) || next < 2 {
+            let nc = alloc_cluster(bpb);
+            if nc == 0 { break; }
+            let _ = fat_write_entry(bpb, nc, fat_eoc(bpb));
+            let _ = fat_write_entry(bpb, cluster, nc);
+            cluster = nc;
+        } else {
+            cluster = next;
         }
     }
-    written
+    done
 }
 
 // ── 8.3 name helpers ────────────────────────────────────────────
@@ -500,6 +610,34 @@ fn _vfat_checksum(short: &[u8; 11]) -> u8 {
     sum
 }
 
+/// Read 13 UTF-16 characters from an LFN directory entry into `out`.
+/// Each LFN entry stores 13 UTF-16LE chars across 3 regions:
+///   bytes  1..11  (5 chars, 10 bytes)
+///   bytes 14..26  (6 chars, 12 bytes)
+///   bytes 28..32  (2 chars,  4 bytes)
+/// Returns the number of valid characters written.
+fn read_lfn_chars(entry: &[u8], out: &mut [u16; 13]) -> usize {
+    // Region 1: 5 chars at offsets 1,3,5,7,9
+    for j in 0..5 {
+        let off = 1 + j * 2;
+        out[j] = entry[off] as u16 | (entry[off + 1] as u16) << 8;
+    }
+    // Region 2: 6 chars at offsets 14,16,18,20,22,24
+    for j in 0..6 {
+        let off = 14 + j * 2;
+        out[5 + j] = entry[off] as u16 | (entry[off + 1] as u16) << 8;
+    }
+    // Region 3: 2 chars at offsets 28,30
+    for j in 0..2 {
+        let off = 28 + j * 2;
+        out[11 + j] = entry[off] as u16 | (entry[off + 1] as u16) << 8;
+    }
+    // Count trailing nulls
+    let mut count = 13;
+    while count > 0 && out[count - 1] == 0 { count -= 1; }
+    count
+}
+
 // ── Directory reading ───────────────────────────────────────────
 
 /// Read a directory sector for a given directory cluster (0 = root for FAT16).
@@ -508,7 +646,7 @@ fn read_dir_sector(bpb: &Bpb, dir_cluster: u32, sec_idx: u64, buf: &mut [u8; 512
         FatType::Fat12 | FatType::Fat16 => {
             if dir_cluster == 0 {
                 // Root directory (fixed location)
-                let root_lba = bpb.reserved_sectors as u64 + bpb.num_fats as u64 * bpb.fat_size_32 as u64;
+                let root_lba = bpb.reserved_sectors as u64 + bpb.num_fats as u64 * fat_sectors(bpb);
                 let root_sectors = ((bpb.root_entry_count as u64 * 32 + 511) / 512) as u64;
                 if sec_idx >= root_sectors { return false; }
                 read_bpb_sector(root_lba + sec_idx, buf)
@@ -549,7 +687,7 @@ fn write_dir_sector(bpb: &Bpb, dir_cluster: u32, sec_idx: u64, buf: &[u8; 512]) 
     match bpb.fat_type {
         FatType::Fat12 | FatType::Fat16 => {
             if dir_cluster == 0 {
-                let root_lba = bpb.reserved_sectors as u64 + bpb.num_fats as u64 * bpb.fat_size_32 as u64;
+                let root_lba = bpb.reserved_sectors as u64 + bpb.num_fats as u64 * fat_sectors(bpb);
                 let root_sectors = ((bpb.root_entry_count as u64 * 32 + 511) / 512) as u64;
                 if sec_idx >= root_sectors { return false; }
                 write_bpb_sector(root_lba + sec_idx, buf)
@@ -597,21 +735,70 @@ fn dir_max_sectors(bpb: &Bpb, dir_cluster: u32) -> u64 {
 }
 
 /// Find an entry in a directory by name. Returns (cluster, size, entry_idx, attr).
+/// Matches both 8.3 short names and LFN (Long File Name) entries.
 fn find_in_dir(bpb: &Bpb, dir_cluster: u32, name: &[u8]) -> Option<(u32, u32, u64, u8)> {
     let attr_lfn: u8 = 0x0F;
     let attr_vol: u8 = 0x08;
     let max_sec = dir_max_sectors(bpb, dir_cluster);
+
+    // LFN accumulation state
+    let mut lfn_name = [0u8; 256];
+    let mut lfn_filled = false;
+
     for sec in 0..max_sec {
         let mut buf = [0u8; 512];
         if !read_dir_sector(bpb, dir_cluster, sec, &mut buf) { return None; }
         for i in 0..16 {
             let off = i * 32;
-            if buf[off] == 0 { return None; }
-            if buf[off] == 0xE5 { continue; }
+            if buf[off] == 0 { return None; } // end of dir
+            if buf[off] == 0xE5 {
+                lfn_filled = false;
+                lfn_name = [0u8; 256];
+                continue;
+            }
             let attr = buf[off + 11];
-            if attr & attr_lfn == attr_lfn { continue; }
-            if attr & attr_vol != 0 { continue; }
+
+            // LFN entry
+            if attr & attr_lfn == attr_lfn {
+                let seq = buf[off];
+                let is_last = seq & 0x40 != 0;
+                let seq_num = (seq & 0x3F) as usize;
+                if seq_num == 0 || seq_num > 20 {
+                    lfn_filled = false;
+                    lfn_name = [0u8; 256];
+                    continue;
+                }
+                let idx = seq_num - 1;
+                let mut utf16 = [0u16; 13];
+                read_lfn_chars(&buf[off..], &mut utf16);
+                for j in 0..13 {
+                    let pos = idx * 13 + j;
+                    if pos >= 256 { break; }
+                    let ch = utf16[j];
+                    if ch == 0 {
+                        lfn_name[pos] = 0;
+                    } else if ch < 0x80 {
+                        let mut c = ch as u8;
+                        if c >= b'a' && c <= b'z' { c -= 32; }
+                        lfn_name[pos] = c;
+                    } else {
+                        lfn_name[pos] = 0xFF;
+                    }
+                }
+                if is_last { lfn_filled = true; }
+                continue;
+            }
+
+            if attr & attr_vol != 0 {
+                lfn_filled = false;
+                lfn_name = [0u8; 256];
+                continue;
+            }
+
+            // 8.3 entry — try matching
             let ename: &[u8; 11] = &buf[off..off + 11].try_into().ok()?;
+
+            // Match against short 8.3 name
             if name_match(ename, name) {
                 let cl = match bpb.fat_type {
                     FatType::Fat32 => le16(&buf, off + 20) as u32 * 65536 + le16(&buf, off + 26) as u32,
@@ -620,9 +807,38 @@ fn find_in_dir(bpb: &Bpb, dir_cluster: u32, name: &[u8]) -> Option<(u32, u32, u6
                 let sz = le32(&buf, off + 28);
                 return Some((cl, sz, sec * 16 + i as u64, attr));
             }
+
+            // Match against LFN name (case-insensitive)
+            if lfn_filled {
+                let lfn_len = lfn_name.iter().position(|&c| c == 0).unwrap_or(256);
+                if lfn_match(&lfn_name[..lfn_len], name) {
+                    let cl = match bpb.fat_type {
+                        FatType::Fat32 => le16(&buf, off + 20) as u32 * 65536 + le16(&buf, off + 26) as u32,
+                        _ => le16(&buf, off + 26) as u32,
+                    };
+                    let sz = le32(&buf, off + 28);
+                    return Some((cl, sz, sec * 16 + i as u64, attr));
+                }
+            }
+
+            // Reset LFN state after the 8.3 entry
+            lfn_filled = false;
+            lfn_name = [0u8; 256];
         }
     }
     None
+}
+
+/// Case-insensitive match of an ASCII name against a user-supplied path component.
+/// Both are ASCII; `lfn` is the uppercased long filename, `user` is the raw lookup.
+fn lfn_match(lfn: &[u8], user: &[u8]) -> bool {
+    if lfn.len() != user.len() { return false; }
+    for i in 0..lfn.len() {
+        let a = lfn[i];
+        let b = if user[i] >= b'a' && user[i] <= b'z' { user[i] - 32 } else { user[i] };
+        if a != b { return false; }
+    }
+    true
 }
 
 /// Find the parent cluster for a path.
@@ -655,6 +871,29 @@ fn resolve_dir(bpb: &Bpb, path: &[u8]) -> Option<u32> {
         while pos < path.len() && path[pos] == b'/' { pos += 1; }
     }
     Some(cluster)
+}
+fn parent_path<'a>(path: &'a [u8]) -> &'a [u8] {
+    let name = last_component(path);
+    if name.is_empty() { return b""; }
+    // find start of name in path
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' { end -= 1; }
+    let mut start = end - name.len();
+    while start > 0 && path[start - 1] == b'/' { start -= 1; }
+    // parent is up to start (trim trailing slashes)
+    let mut p_end = start;
+    while p_end > 0 && path[p_end - 1] == b'/' { p_end -= 1; }
+    // keep leading slash if original had it
+    if p_end == 0 {
+        if !path.is_empty() && path[0]==b'/' { return b"/"; }
+        return b"";
+    }
+    &path[..p_end]
+}
+fn resolve_parent(bpb: &Bpb, path: &[u8]) -> Option<u32> {
+    let p = parent_path(path);
+    if p.is_empty() || (p.len()==1 && p[0]==b'/') { return Some(root_cluster(bpb)); }
+    resolve_dir(bpb, p)
 }
 
 /// Get the last component of a path.
@@ -807,13 +1046,50 @@ fn get_bpb() -> Option<Bpb> {
 
 // ── VFS Driver implementation (function pointers) ────────────────
 
-fn fat_open(path: &[u8], _flags: u64) -> Option<usize> {
+fn fat_open(path: &[u8], flags: u64) -> Option<usize> {
     let bpb = get_bpb()?;
-    let dir = resolve_dir(&bpb, path)?;
+    let dir = resolve_parent(&bpb, path)?;
     let name = last_component(path);
     if name.is_empty() { return Some(0); }
-    let (cl, sz, _, _) = find_in_dir(&bpb, dir, name)?;
-    Some((cl as usize) << 32 | sz as usize)
+    if let Some((cl, sz, _, _)) = find_in_dir(&bpb, dir, name) {
+        // TRUNC flag: truncate file to 0
+        if flags & 0x200 != 0 {
+            free_chain(&bpb, cl);
+            // update dir entry size to 0 and cluster 0
+            // find entry and zero it
+            if let Some((_, _, entry_idx, _)) = find_in_dir(&bpb, dir, name) {
+                let sec = entry_idx / 16;
+                let off = ((entry_idx % 16) as usize) * 32;
+                let mut buf = [0u8; 512];
+                if read_dir_sector(&bpb, dir, sec, &mut buf) {
+                    // clear cluster and size
+                    match bpb.fat_type {
+                        FatType::Fat32 => {
+                            write_le16(&mut buf, off + 20, 0);
+                            write_le16(&mut buf, off + 26, 0);
+                        }
+                        _ => write_le16(&mut buf, off + 26, 0),
+                    }
+                    write_le32(&mut buf, off + 28, 0);
+                    let _ = write_dir_sector(&bpb, dir, sec, &buf);
+                }
+            }
+            return Some(0);
+        }
+        return Some((cl as usize) << 32 | sz as usize)
+    }
+    // Not found — create if O_CREAT
+    if flags & 0x100 == 0 { return None; }
+    let short = name_to_83(name)?;
+    let cluster = alloc_cluster(&bpb);
+    if cluster == 0 { return None; }
+    let _ = fat_write_entry(&bpb, cluster, fat_eoc(&bpb));
+    // zero first cluster
+    let zero = [0u8; 512];
+    let lba = cluster_to_lba(&bpb, cluster);
+    for s in 0..bpb.sectors_per_cluster as u64 { let _ = write_bpb_sector(lba + s, &zero); }
+    if add_dir_entry(&bpb, dir, name, &short, 0x20, cluster, 0).is_none() { free_chain(&bpb, cluster); return None; }
+    Some((cluster as usize) << 32 | 0)
 }
 
 fn fat_close(_handle: usize) {}
@@ -821,8 +1097,14 @@ fn fat_close(_handle: usize) {}
 fn fat_read(handle: usize, buf: &mut [u8], offset: u64) -> Option<usize> {
     let bpb = get_bpb()?;
     let cluster = (handle >> 32) as u32;
-    let size = (handle & 0xFFFFFFFF) as u32;
-    let to_read = buf.len().min(size as usize - offset as usize);
+    let size = (handle & 0xFFFFFFFF) as u64;
+    if offset >= size { return Some(0); }
+    if cluster < 2 {
+        // Пустой файл (size 0) — нечего читать; раньше уходил в read_chain с cl=0
+        return Some(0);
+    }
+    let avail = (size - offset) as usize;
+    let to_read = buf.len().min(avail);
     if to_read == 0 { return Some(0); }
     let n = read_chain(&bpb, cluster, offset, &mut buf[..to_read]);
     Some(n)
@@ -840,7 +1122,12 @@ fn fat_stat(path: &[u8]) -> Option<StatInfo> {
     if path.is_empty() || (path.len() == 1 && path[0] == b'/') {
         return Some(StatInfo { size: 0, is_dir: true, cluster: root_cluster(&bpb) });
     }
-    let dir = resolve_dir(&bpb, path)?;
+    // if path is a directory itself, try to resolve it directly
+    if let Some(dir_cl) = resolve_dir(&bpb, path) {
+        // Check if it's a directory (found as dir)
+        return Some(StatInfo { size: 0, is_dir: true, cluster: dir_cl });
+    }
+    let dir = resolve_parent(&bpb, path)?;
     let name = last_component(path);
     if name.is_empty() { return Some(StatInfo { size: 0, is_dir: true, cluster: root_cluster(&bpb) }); }
     let (cl, sz, _, attr) = find_in_dir(&bpb, dir, name)?;
@@ -860,6 +1147,12 @@ fn fat_readdir(path: &[u8], entries: &mut [DirEntry]) -> Option<usize> {
     let max_sec = dir_max_sectors(&bpb, dir_cluster);
     let mut count = 0usize;
 
+    // LFN accumulation state.
+    // LFN entries appear BEFORE the 8.3 entry, in reverse sequence order
+    // (highest seq first). We fill lfn_name from the back using seq as index.
+    let mut lfn_name = [0u8; 256];
+    let mut lfn_filled = false; // true once we've seen the last-LFN entry (bit 6)
+
     for sec in 0..max_sec {
         if count >= entries.len() { break; }
         let mut buf = [0u8; 512];
@@ -867,12 +1160,62 @@ fn fat_readdir(path: &[u8], entries: &mut [DirEntry]) -> Option<usize> {
         for i in 0..16 {
             if count >= entries.len() { break; }
             let off = i * 32;
-            if buf[off] == 0 { return Some(count); }
-            if buf[off] == 0xE5 { continue; }
-            let attr = buf[off + 11];
-            if attr & attr_lfn == attr_lfn { continue; }
-            if attr & attr_vol != 0 { continue; }
 
+            // Empty marker — end of directory
+            if buf[off] == 0 {
+                return Some(count);
+            }
+            if buf[off] == 0xE5 {
+                // Deleted entry — discard any pending LFN state
+                lfn_filled = false;
+                lfn_name = [0u8; 256];
+                continue;
+            }
+
+            let attr = buf[off + 11];
+
+            // LFN entry
+            if attr & attr_lfn == attr_lfn {
+                let seq = buf[off]; // sequence number
+                let is_last = seq & 0x40 != 0;
+                let seq_num = (seq & 0x3F) as usize; // 1-based
+                if seq_num == 0 || seq_num > 20 {
+                    // Invalid LFN entry — reset
+                    lfn_filled = false;
+                    lfn_name = [0u8; 256];
+                    continue;
+                }
+                let idx = seq_num - 1; // 0-based
+                // Extract 13 UTF-16 chars and convert to ASCII
+                let mut utf16 = [0u16; 13];
+                read_lfn_chars(&buf[off..], &mut utf16);
+                for j in 0..13 {
+                    let pos = idx * 13 + j;
+                    if pos >= 256 { break; }
+                    let ch = utf16[j];
+                    if ch == 0 {
+                        lfn_name[pos] = 0;
+                    } else if ch < 0x80 {
+                        let mut c = ch as u8;
+                        if c >= b'a' && c <= b'z' { c -= 32; } // ASCII uppercase
+                        lfn_name[pos] = c;
+                    } else {
+                        // Non-ASCII — mark as 0xFF (placeholder)
+                        lfn_name[pos] = 0xFF;
+                    }
+                }
+                if is_last { lfn_filled = true; }
+                continue;
+            }
+
+            if attr & attr_vol != 0 {
+                // Volume label — discard LFN state
+                lfn_filled = false;
+                lfn_name = [0u8; 256];
+                continue;
+            }
+
+            // Normal 8.3 entry — emit it
             let raw_name = format_name(&buf[off..]);
             let name_len = raw_name.iter().position(|&c| c == 0).unwrap_or(13);
             let mut e = DirEntry {
@@ -880,10 +1223,24 @@ fn fat_readdir(path: &[u8], entries: &mut [DirEntry]) -> Option<usize> {
                 is_dir: attr & 0x10 != 0,
                 size: le32(&buf, off + 28),
             };
-            let copy_len = name_len.min(MAX_NAME - 1);
-            e.name[..copy_len].copy_from_slice(&raw_name[..copy_len]);
+
+            if lfn_filled {
+                // Use the accumulated long filename
+                let lfn_len = lfn_name.iter().position(|&c| c == 0).unwrap_or(256);
+                let copy_len = lfn_len.min(MAX_NAME - 1);
+                e.name[..copy_len].copy_from_slice(&lfn_name[..copy_len]);
+            } else {
+                // Fall back to 8.3 short name
+                let copy_len = name_len.min(MAX_NAME - 1);
+                e.name[..copy_len].copy_from_slice(&raw_name[..copy_len]);
+            }
+
             entries[count] = e;
             count += 1;
+
+            // Reset LFN state for the next entry
+            lfn_filled = false;
+            lfn_name = [0u8; 256];
         }
     }
     Some(count)
@@ -891,7 +1248,7 @@ fn fat_readdir(path: &[u8], entries: &mut [DirEntry]) -> Option<usize> {
 
 fn fat_mkdir(path: &[u8]) -> bool {
     let bpb = match get_bpb() { Some(b) => b, None => return false };
-    let parent = match resolve_dir(&bpb, path) {
+    let parent = match resolve_parent(&bpb, path) {
         Some(p) => p,
         None => { uart_print("[FAT] path not found\r\n"); return false; }
     };
@@ -920,7 +1277,7 @@ fn fat_mkdir(path: &[u8]) -> bool {
 
 fn fat_rmdir(path: &[u8]) -> bool {
     let bpb = match get_bpb() { Some(b) => b, None => return false };
-    let parent = match resolve_dir(&bpb, path) {
+    let parent = match resolve_parent(&bpb, path) {
         Some(p) => p,
         None => { uart_print("[FAT] path not found\r\n"); return false; }
     };
@@ -943,7 +1300,7 @@ fn fat_rmdir(path: &[u8]) -> bool {
 
 fn fat_unlink(path: &[u8]) -> bool {
     let bpb = match get_bpb() { Some(b) => b, None => return false };
-    let parent = match resolve_dir(&bpb, path) {
+    let parent = match resolve_parent(&bpb, path) {
         Some(p) => p,
         None => { uart_print("[FAT] path not found\r\n"); return false; }
     };

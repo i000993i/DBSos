@@ -5,7 +5,7 @@ use super::uart;
 use crate::memory;
 use core::ptr::{read_volatile, write_volatile};
 
-const E1000_VENDOR: u16 = 0x8086;
+const _E1000_VENDOR: u16 = 0x8086;
 
 // --- MMIO регистры ---
 const REG_CTRL: u32 = 0x0000;
@@ -101,15 +101,18 @@ struct ArpEntry {
 }
 static mut ARP_ENTRIES: [ArpEntry; ARP_CACHE] = [ArpEntry { ip: [0; 4], mac: [0; 6], valid: false }; ARP_CACHE];
 
-fn arp_slot(ip: &[u8; 4]) -> usize {
+fn _arp_slot(ip: &[u8; 4]) -> usize {
     (ip[0] as usize * 7 + ip[1] as usize * 13 + ip[2] as usize * 17 + ip[3] as usize * 29) % ARP_CACHE
 }
 
 fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
     unsafe {
-        let i = arp_slot(ip);
-        let e = &ARP_ENTRIES[i];
-        if e.valid && e.ip == *ip { Some(e.mac) } else { None }
+        // Линейный поиск: хэш-слот может быть занят коллизией,
+        // старый код терял записи при коллизии (перезапись без проверки).
+        for e in ARP_ENTRIES.iter() {
+            if e.valid && e.ip == *ip { return Some(e.mac); }
+        }
+        None
     }
 }
 
@@ -118,10 +121,21 @@ pub fn arp_lookup_public(ip: &[u8; 4]) -> Option<[u8; 6]> {
     arp_lookup(ip)
 }
 
+static mut ARP_VICTIM: usize = 0;
+
 fn arp_learn(ip: [u8; 4], mac: [u8; 6]) {
     unsafe {
-        let i = arp_slot(&ip);
-        ARP_ENTRIES[i] = ArpEntry { ip, mac, valid: true };
+        // Обновить существующую
+        for e in ARP_ENTRIES.iter_mut() {
+            if e.valid && e.ip == ip { e.mac = mac; return; }
+        }
+        // Занять свободный слот
+        for e in ARP_ENTRIES.iter_mut() {
+            if !e.valid { *e = ArpEntry { ip, mac, valid: true }; return; }
+        }
+        // Вытеснение round-robin (вместо перезаписи по хэшу)
+        ARP_ENTRIES[ARP_VICTIM % ARP_CACHE] = ArpEntry { ip, mac, valid: true };
+        ARP_VICTIM = ARP_VICTIM.wrapping_add(1);
     }
 }
 
@@ -149,15 +163,23 @@ fn find_nic() -> bool {
     for dev in 0..32 {
         for func in 0..8 {
             let vendor = super::pci::read16(0, dev as u8, func as u8, 0x00);
-            if vendor != E1000_VENDOR {
-                if func == 0 { break; }
-                continue;
-            }
+            if vendor == 0xFFFF { if func == 0 { break; } continue; }
+            let device = super::pci::read16(0, dev as u8, func as u8, 0x02);
             let reg08 = super::pci::read32(0, dev as u8, func as u8, 0x08);
             let class = ((reg08 >> 24) & 0xFF) as u8;
             if class != 0x02 { continue; }
+            // Intel e1000/e1000e: 8086:100E/10D3/10EA etc. Не хватаем RTL8139 (10EC)
+            // и virtio-net (1AF4) — у них свои драйверы.
+            if vendor == 0x8086 {
+                if !matches!(device, 0x100E | 0x100F | 0x1010 | 0x1075 | 0x10D3 | 0x10EA | 0x1502 | 0x153A) {
+                    // Неизвестный Intel NIC — всё равно пробуем как e1000-совместимый
+                    // (регистры совместимы у всего семейства), но логируем.
+                }
+            } else { continue; }
             let bar0 = super::pci::read32(0, dev as u8, func as u8, 0x10);
+            if bar0 & 1 != 0 { continue; } // I/O BAR — не наш (нужен MEM)
             let mmio = (bar0 & 0xFFFFFFF0) as u64;
+            if mmio == 0 { continue; }
             unsafe { MMIO = mmio; NIC_BUS = 0; NIC_DEV = dev as u8; NIC_FUNC = func as u8; }
             return true;
         }
@@ -569,7 +591,49 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> bool {
     pkt[32..38].copy_from_slice(&zero_mac);
     pkt[38..42].copy_from_slice(&target_ip);
 
-    tx_send(&pkt)
+    tx_route(&pkt)
+}
+
+// ====== Активный NIC (автовыбор адаптером) ────────────────────────────
+// 0 = e1000 (primary), 1 = RTL8139 (fallback). Весь верхний стек (ARP/IP/TCP)
+// идёт через tx_route()/input_frame() и не знает, какая карта внизу.
+pub const NIC_E1000: u8 = 0;
+pub const NIC_RTL8139: u8 = 1;
+static mut ACTIVE_NIC: u8 = NIC_E1000;
+
+pub fn active_nic() -> u8 { unsafe { ACTIVE_NIC } }
+pub fn active_nic_name() -> &'static str {
+    unsafe {
+        match ACTIVE_NIC {
+            NIC_RTL8139 => "rtl8139",
+            _ => "e1000",
+        }
+    }
+}
+
+/// Переключить активную карту. Для rtl8139 требует готового драйвера.
+pub fn set_active_nic(n: u8) -> bool {
+    if n == NIC_RTL8139 && !crate::driver::rtl8139::is_ready() {
+        return false;
+    }
+    unsafe { ACTIVE_NIC = n; }
+    true
+}
+
+/// MAC активной карты (для failover обновляется адаптером).
+pub fn set_mac(m: [u8; 6]) {
+    unsafe { OUR_MAC = m; }
+}
+
+/// TX через активную карту.
+fn tx_route(data: &[u8]) -> bool {
+    unsafe {
+        if ACTIVE_NIC == NIC_RTL8139 {
+            crate::driver::rtl8139::send_frame(data)
+        } else {
+            tx_send(data)
+        }
+    }
 }
 
 // ====== Публичный API ======
@@ -613,14 +677,17 @@ pub fn set_dns_server(dns: [u8; 4]) {
 
 /// Отправить сырой кадр Ethernet (используется TCP-стеком).
 pub fn send_raw(data: &[u8]) -> bool {
-    tx_send(data)
+    tx_route(data)
 }
 
 /// Отправить IPv4+UDP-датаграмму.
 /// `dst_mac` — уже зарезолвленный MAC-адрес получателя.
 pub fn send_udp(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> bool {
+    static mut IP_ID: u16 = 0;
+    let ip_id = unsafe { let v = IP_ID; IP_ID = IP_ID.wrapping_add(1); v };
     let udp_len = 8 + payload.len();
     let ip_len = 20 + udp_len;
+    if 14 + ip_len > 1514 || payload.len() > 1472 { return false; }
     let mut frame = [0u8; 1514];
     frame[0..6].copy_from_slice(&dst_mac);
     frame[6..12].copy_from_slice(&unsafe { OUR_MAC });
@@ -628,7 +695,7 @@ pub fn send_udp(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], src_port: u1
     let ip = &mut frame[14..34];
     ip[0] = 0x45; ip[1] = 0;
     ip[2] = (ip_len >> 8) as u8; ip[3] = ip_len as u8;
-    ip[4] = 0; ip[5] = 0; ip[6] = 0; ip[7] = 0;
+    ip[4] = (ip_id >> 8) as u8; ip[5] = ip_id as u8; ip[6] = 0x40; ip[7] = 0; // ID + DF
     ip[8] = 64; ip[9] = IP_PROTO_UDP; ip[10] = 0; ip[11] = 0;
     ip[12..16].copy_from_slice(&src_ip);
     ip[16..20].copy_from_slice(&dst_ip);
@@ -637,11 +704,38 @@ pub fn send_udp(src_ip: [u8; 4], dst_mac: [u8; 6], dst_ip: [u8; 4], src_port: u1
     frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
     frame[36] = (dst_port >> 8) as u8; frame[37] = dst_port as u8;
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
-    frame[40] = 0; frame[41] = 0; // csum=0 (optional in IPv4)
+    // UDP checksum: считаем псевдозаголовок, 0 = без checksum тоже валидно,
+    // но QEMU slirp и часть серверов корректнее отвечают с checksum.
+    let csum = udp_checksum(&src_ip, &dst_ip, src_port, dst_port, payload);
+    frame[40] = (csum >> 8) as u8; frame[41] = csum as u8;
     if !payload.is_empty() {
         frame[42..42 + payload.len()].copy_from_slice(payload);
     }
-    tx_send(&frame[..14 + ip_len])
+    tx_route(&frame[..14 + ip_len])
+}
+
+/// UDP checksum с псевдозаголовком. 0 заменяем на 0xFFFF (RFC 768).
+fn udp_checksum(src: &[u8; 4], dst: &[u8; 4], sport: u16, dport: u16, payload: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    sum += ((src[0] as u32) << 8) | src[1] as u32;
+    sum += ((src[2] as u32) << 8) | src[3] as u32;
+    sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+    sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+    sum += IP_PROTO_UDP as u32;
+    let ulen = (8 + payload.len()) as u32;
+    sum += ulen;
+    sum += sport as u32;
+    sum += dport as u32;
+    sum += ulen;
+    let mut i = 0;
+    while i + 1 < payload.len() {
+        sum += ((payload[i] as u32) << 8) | payload[i + 1] as u32;
+        i += 2;
+    }
+    if i < payload.len() { sum += (payload[i] as u32) << 8; }
+    while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+    let c = !(sum as u16);
+    if c == 0 { 0xFFFF } else { c }
 }
 
 /// Попытаться резолвить MAC-адрес по IP. Сначала ищет в ARP-кэше; если нет —
@@ -758,7 +852,16 @@ pub fn rx_software_test() {
 pub fn poll() {
     while rx_available() {
         if let Some((data, _idx)) = rx_recv() {
-            if data.len() < 14 { continue; }
+            input_frame(data);
+        }
+    }
+    // Вторая проводная карта (если есть) складывает кадры в тот же стек.
+    crate::driver::rtl8139::poll_rx();
+}
+
+/// Обработка одного Ethernet-кадра верхним стеком (общая для e1000 и RTL8139).
+pub(crate) fn input_frame(data: &[u8]) {
+            if data.len() < 14 { return; }
             let eth = unsafe { &*(data.as_ptr() as *const EthHdr) };
 
             if eth.ether_type == ETH_TYPE_ARP && data.len() >= 42 {
@@ -766,7 +869,7 @@ pub fn poll() {
                 if arp.op == ARP_REQUEST && arp.target_ip == unsafe { OUR_IP } {
                     let mut resp = [0u8; 60];
                     let len = build_arp_reply(&mut resp, &arp.sender_mac, &arp.sender_ip);
-                    tx_send(&resp[..len]);
+                    tx_route(&resp[..len]);
                     uart::write_str("[NET] ARP reply to ");
                     print_ip(&arp.sender_ip);
                     uart::write_str("\r\n");
@@ -786,19 +889,33 @@ pub fn poll() {
 
             if eth.ether_type == ETH_TYPE_IP && data.len() >= 34 {
                 let ip = unsafe { &*(data.as_ptr().add(14) as *const IpHdr) };
-                // Принимаем пакеты для нас, а также broadcast (нужно для DHCP).
-                let ours = ip.dst == unsafe { OUR_IP } || ip.dst == [255, 255, 255, 255];
-                if !ours { continue; }
+                // Принимаем пакеты для нас, broadcast, 0.0.0.0 (DHCP до конфига),
+                // а также UDP dport=68 (DHCP-клиент): сервер может юникастить
+                // OFFER/ACK на ещё не назначенный yiaddr — фильтр по IP его бы отбросил.
+                let mut ours = ip.dst == unsafe { OUR_IP }
+                    || ip.dst == [255, 255, 255, 255]
+                    || ip.dst == [0, 0, 0, 0];
+                // Быстрый peek UDP dport без полного парсинга
+                if !ours && ip.protocol == IP_PROTO_UDP && data.len() >= 34 + 8 {
+                    let dport = ((data[34 + 2] as u16) << 8) | data[34 + 3] as u16;
+                    if dport == 68 { ours = true; }
+                }
+                if !ours { return; }
+                // Учим MAC шлюза/пира с любого валидного IP-пакета (помогает ARP)
+                // (не перезаписываем кэш мусором: только если src не 0.0.0.0)
+                if ip.src != [0, 0, 0, 0] {
+                    arp_learn(ip.src, eth.src);
+                }
                 if ip.protocol == 6 {
                     // TCP — передать сегмент TCP-стеку.
                     let tcp_seg = &data[34..];
                     crate::driver::tcp::input(ip.src, eth.src, tcp_seg);
-                    continue;
+                    return;
                 }
                 if ip.protocol == IP_PROTO_UDP {
                     // UDP — передать DHCP/DNS-обработчикам.
                     crate::driver::udp::input(data, ip.src, eth.src);
-                    continue;
+                    return;
                 }
                 if ip.protocol == IP_PROTO_ICMP {
                     let icmp = unsafe { &*(data.as_ptr().add(14 + 20) as *const IcmpHdr) };
@@ -806,15 +923,13 @@ pub fn poll() {
                         let payload = &data[14 + 20 + 8..];
                         let mut resp = [0u8; 1514];
                         let len = build_icmp_reply(&mut resp, &eth.src, ip, icmp, payload);
-                        tx_send(&resp[..len]);
+                        tx_route(&resp[..len]);
                         uart::write_str("[NET] ICMP echo reply to ");
                         print_ip(&ip.src);
                         uart::write_str("\r\n");
                     }
                 }
             }
-        }
-    }
 }
 
 pub struct E1000Driver;
@@ -1127,7 +1242,7 @@ pub fn send_icmp_ping(target_ip: [u8; 4]) -> bool {
     pkt[36] = (icmp_csum >> 8) as u8;
     pkt[37] = (icmp_csum & 0xFF) as u8;
 
-    tx_send(&pkt[..42])
+    tx_route(&pkt[..42])
 }
 
 fn uart_dec(val: u64) {

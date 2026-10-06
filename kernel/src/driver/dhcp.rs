@@ -77,8 +77,8 @@ fn build_header(pkt: &mut [u8; BOOTP_LEN], xid: u32) {
     pkt[F_MAGIC..F_MAGIC + 4].copy_from_slice(&MAGIC_COOKIE);
 }
 
-/// Отправить DISCOVER.
-fn send_discover(xid: u32) {
+/// Отправить DISCOVER. Возвращает (пакет, длина) для ретрансмита.
+fn send_discover(xid: u32) -> ([u8; BOOTP_LEN], usize) {
     let mut pkt = [0u8; BOOTP_LEN];
     build_header(&mut pkt, xid);
     let mut pos = F_OPT;
@@ -89,11 +89,13 @@ fn send_discover(xid: u32) {
     cid[1..7].copy_from_slice(&net::mac());
     add_opt(&mut pkt, &mut pos, O_CLIENT_ID, &cid);
     pkt[pos] = O_END;
-    udp::send([0, 0, 0, 0], bcast_ip(), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt);
+    let len = pos + 1;
+    udp::send([0, 0, 0, 0], bcast_ip(), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt[..len]);
+    (pkt, len)
 }
 
 /// Отправить REQUEST для выбранного IP у указанного сервера.
-fn send_request(xid: u32, requested_ip: [u8; 4], server_id: [u8; 4]) {
+fn send_request(xid: u32, requested_ip: [u8; 4], server_id: [u8; 4]) -> ([u8; BOOTP_LEN], usize) {
     let mut pkt = [0u8; BOOTP_LEN];
     build_header(&mut pkt, xid);
     let mut pos = F_OPT;
@@ -106,7 +108,9 @@ fn send_request(xid: u32, requested_ip: [u8; 4], server_id: [u8; 4]) {
     cid[1..7].copy_from_slice(&net::mac());
     add_opt(&mut pkt, &mut pos, O_CLIENT_ID, &cid);
     pkt[pos] = O_END;
-    udp::send([0, 0, 0, 0], bcast_ip(), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt);
+    let len = pos + 1;
+    udp::send([0, 0, 0, 0], bcast_ip(), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &pkt[..len]);
+    (pkt, len)
 }
 
 /// Прочитать option из DHCP-ответа. Возвращает копию значения.
@@ -115,11 +119,17 @@ fn get_opt(pkt: &[u8], code: u8, out: &mut [u8]) -> usize {
         return 0;
     }
     let mut pos = F_OPT;
-    while pos + 1 < pkt.len() {
+    while pos < pkt.len() {
         let c = pkt[pos];
         if c == O_END {
             break;
         }
+        if c == 0 {
+            // PAD — single byte, skip
+            pos += 1;
+            continue;
+        }
+        if pos + 1 >= pkt.len() { break; }
         let len = pkt[pos + 1] as usize;
         if pos + 2 + len > pkt.len() {
             break;
@@ -168,10 +178,18 @@ fn uart_ip(ip: &[u8; 4]) {
 
 /// Получить DHCP-ответ (OFFER/ACK) для нашего xid.
 /// Качает `net::poll()` до нужного пакета или таймаута.
-fn wait_reply(xid: u32, timeout_ms: u64) -> Option<[u8; BOOTP_LEN]> {
+/// С ретрансмитом: каждые 1с повторно шлём последний запрос (slirp иногда
+/// теряет первый broadcast).
+fn wait_reply(xid: u32, timeout_ms: u64, resend: &[u8; BOOTP_LEN], resend_len: usize) -> Option<[u8; BOOTP_LEN]> {
     let deadline = crate::timer::millis() + timeout_ms;
+    let mut last_send = crate::timer::millis();
     while crate::timer::millis() < deadline {
         net::poll();
+        // Ретрансмит раз в 1000мс
+        if crate::timer::millis().wrapping_sub(last_send) >= 1000 {
+            udp::send([0, 0, 0, 0], bcast_ip(), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &resend[..resend_len]);
+            last_send = crate::timer::millis();
+        }
         if !udp::rx_pending() {
             continue;
         }
@@ -203,13 +221,18 @@ fn wait_reply(xid: u32, timeout_ms: u64) -> Option<[u8; BOOTP_LEN]> {
 
 /// Запустить полный цикл DHCP. Возвращает true при успехе и применяет конфиг.
 pub fn run(timeout_ms: u64) -> bool {
+    // NIC должен быть готов: иначе DISCOVER уйдёт в никуда
+    if net::mac() == [0; 6] {
+        uart::write_str("[DHCP] no NIC, abort\r\n");
+        return false;
+    }
     let xid = next_xid();
     uart::write_str("[DHCP] DISCOVER...\r\n");
     udp::rx_clear();
-    send_discover(xid);
+    let (disc, disc_len) = send_discover(xid);
 
     // Ожидаем OFFER
-    let offer = match wait_reply(xid, timeout_ms) {
+    let offer = match wait_reply(xid, timeout_ms, &disc, disc_len) {
         Some(o) => o,
         None => {
             uart::write_str("[DHCP] timeout waiting OFFER\r\n");
@@ -231,9 +254,9 @@ pub fn run(timeout_ms: u64) -> bool {
     // REQUEST
     uart::write_str("[DHCP] REQUEST...\r\n");
     udp::rx_clear();
-    send_request(xid, yiaddr, server_id);
+    let (req, req_len) = send_request(xid, yiaddr, server_id);
 
-    let ack = match wait_reply(xid, timeout_ms) {
+    let ack = match wait_reply(xid, timeout_ms, &req, req_len) {
         Some(a) => a,
         None => {
             uart::write_str("[DHCP] timeout waiting ACK\r\n");

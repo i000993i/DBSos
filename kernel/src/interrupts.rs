@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IdtEntry {
     off_lo: u16,
@@ -200,7 +200,8 @@ fn hex32(v: u32) {
 }
 
 #[no_mangle]
-fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: u64, saved_rflags: u64) {
+// Вызывается из asm по Win64 ABI (rcx/rdx/r8/r9/[rsp+32]) — поэтому extern "C".
+extern "C" fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: u64, saved_rflags: u64) {
     // Page fault: vector 14 — handle specially
     if vector == 14 {
         let cr2: u64;
@@ -392,6 +393,7 @@ fn default_handler_rust(vector: u64, error_code: u64, saved_rip: u64, saved_cs: 
             crate::scheduler::exit();
         } else {
             crate::driver::uart::write_str("  -> KERNEL #PF (supervisor access), HALTED\r\n");
+            unsafe { crate::backtrace::dump_current(12); }
             loop { core::hint::spin_loop(); }
         }
     }

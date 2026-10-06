@@ -12,8 +12,16 @@ use super::udp;
 
 pub const DNS_PORT: u16 = 53;
 
-const DNS_ID: u16 = 0x1234;
+static mut DNS_NEXT_ID: u16 = 0x1234;
 const DNS_MAX: usize = 512;
+
+fn next_dns_id() -> u16 {
+    unsafe {
+        let t = crate::timer::ticks() as u16 ^ crate::timer::millis() as u16;
+        DNS_NEXT_ID = DNS_NEXT_ID.wrapping_add(1).wrapping_add(t);
+        DNS_NEXT_ID
+    }
+}
 
 fn be16(v: u16) -> [u8; 2] {
     [(v >> 8) as u8, v as u8]
@@ -124,10 +132,11 @@ pub fn resolve(name: &[u8], timeout_ms: u64) -> Option<[u8; 4]> {
         return None;
     }
 
+    let dns_id = next_dns_id();
     let mut query = [0u8; DNS_MAX];
     // DNS header (12 bytes)
-    query[0] = (DNS_ID >> 8) as u8;
-    query[1] = DNS_ID as u8;
+    query[0] = (dns_id >> 8) as u8;
+    query[1] = dns_id as u8;
     query[2] = 0x01; // flags: RD
     query[3] = 0x00;
     query[4] = 0x00; query[5] = 0x01; // QDCOUNT = 1
@@ -141,7 +150,10 @@ pub fn resolve(name: &[u8], timeout_ms: u64) -> Option<[u8; 4]> {
     query[pos..pos + 2].copy_from_slice(&be16(1)); // QCLASS = IN
     pos += 2;
 
-    let src_port: u16 = 0xC000 | ((net::mac()[4] as u16) << 8) | net::mac()[5] as u16;
+    let src_port: u16 = {
+        let r = next_dns_id();
+        0x8000 | (r & 0x7FFF)
+    };
 
     uart::write_str("[DNS] query ");
     let s = core::str::from_utf8(name).unwrap_or("?");
@@ -157,8 +169,17 @@ pub fn resolve(name: &[u8], timeout_ms: u64) -> Option<[u8; 4]> {
     }
 
     let deadline = crate::timer::millis() + timeout_ms;
+    let mut last_send = crate::timer::millis();
+    // Сохраняем запрос для ретрансмита (slirp/потери)
+    let mut saved = [0u8; DNS_MAX];
+    saved[..pos].copy_from_slice(&query[..pos]);
+    let saved_len = pos;
     while crate::timer::millis() < deadline {
         net::poll();
+        if crate::timer::millis().wrapping_sub(last_send) >= 1000 {
+            let _ = udp::send(net::our_ip(), dns_ip, src_port, DNS_PORT, &saved[..saved_len]);
+            last_send = crate::timer::millis();
+        }
         if !udp::rx_pending() {
             continue;
         }
@@ -168,10 +189,12 @@ pub fn resolve(name: &[u8], timeout_ms: u64) -> Option<[u8; 4]> {
             continue;
         }
         let id = rd16(pl, 0);
-        if id != DNS_ID {
+        if id != dns_id {
             uart::write_str("[DNS] rxd id=0x");
             uart_hex(id as u32);
-            uart::write_str(" (want 0x1234)\r\n");
+            uart::write_str(" (want 0x");
+            uart_hex(dns_id as u32);
+            uart::write_str(")\r\n");
             udp::rx_clear();
             continue;
         }

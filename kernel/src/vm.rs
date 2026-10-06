@@ -134,21 +134,58 @@ unsafe fn walk_or_create(pml4_ptr: *mut u64, virt: u64, create: bool) -> (u64, u
 
 /// Map a 4KB page (phys → virt) in the given address space.
 /// walk_or_create handles 2MB huge page → 4KB PT split when needed.
+#[inline] unsafe fn vm_irq_save() -> u64 { let f: u64; core::arch::asm!("pushfq; pop {}", out(reg) f); core::arch::asm!("cli"); f }
+#[inline] unsafe fn vm_irq_restore(f: u64) { if f & (1<<9) !=0 { core::arch::asm!("sti"); } }
+
 pub unsafe fn map_page(pml4: *mut u64, phys: u64, virt: u64, flags: u64) -> u64 {
+    let f = vm_irq_save();
     let (pte_addr, _existing) = walk_or_create(pml4, virt, true);
-    if pte_addr == 0 { return !0; }
+    if pte_addr == 0 { vm_irq_restore(f); return !0; }
     let entry = pte_from_phys(phys) | PTE_PRESENT | flags;
     *(pte_addr as *mut u64) = entry;
     core::arch::asm!("invlpg [{}]", in(reg) virt);
+    vm_irq_restore(f);
     0
 }
 
 /// Unmap a virtual address.
 pub unsafe fn unmap_page(pml4: *mut u64, virt: u64) {
+    let f = vm_irq_save();
     let (pte_addr, existing) = walk_or_create(pml4, virt, false);
-    if pte_addr == 0 || existing & PTE_PRESENT == 0 { return; }
+    if pte_addr == 0 || existing & PTE_PRESENT == 0 { vm_irq_restore(f); return; }
     *(pte_addr as *mut u64) = 0;
     core::arch::asm!("invlpg [{}]", in(reg) virt);
+    vm_irq_restore(f);
+}
+
+/// Проверить что [virt, virt+len) полностью замаплен с PTE_USER.
+/// Только чтение таблиц (create=false). Основа для EFAULT вместо #PF:
+/// кривой user-указатель отклоняется в syscall, а не роняет задачу.
+pub unsafe fn is_user_range_mapped(pml4: *mut u64, virt: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if pml4.is_null() {
+        return false;
+    }
+    let end = match virt.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    // Только user-half (канонические младшие адреса)
+    if virt >= 0x0000_8000_0000_0000 || end > 0x0000_8000_0000_0000 {
+        return false;
+    }
+    let mut addr = virt & !0xFFFu64;
+    let end_page = (end + 0xFFF) & !0xFFFu64;
+    while addr < end_page {
+        let (pte_addr, pte) = walk_or_create(pml4, addr, false);
+        if pte_addr == 0 || pte & PTE_PRESENT == 0 || pte & PTE_USER == 0 {
+            return false;
+        }
+        addr += 4096;
+    }
+    true
 }
 
 /// Lookup physical address for a virtual address.
@@ -289,6 +326,24 @@ pub unsafe fn destroy_address_space(pml4: *mut u64) {
 /// Saved kernel PML4 physical address — restored when exiting a ring-3 task.
 pub static mut KERNEL_PML4: u64 = 0;
 
+/// Map an MMIO region (phys -> same virt, UC) для драйверов после EBS.
+/// Возвращает 0 при успехе, !0 при ошибке. Идемпотентна.
+pub unsafe fn map_mmio(phys: u64, size: usize) -> u64 {
+    if size == 0 { return !0; }
+    let pml4 = KERNEL_PML4 as *mut u64;
+    if pml4.is_null() { return !0; }
+    let start = phys & !0xFFFu64;
+    let end = (phys + size as u64 + 0xFFF) & !0xFFFu64;
+    let mut addr = start;
+    while addr < end {
+        if map_page(pml4, addr, addr, PTE_WRITABLE | PTE_CACHE_DISABLE) != 0 {
+            return !0;
+        }
+        addr += 4096;
+    }
+    0
+}
+
 /// Initialize virtual memory: set up kernel's address space.
 pub const LAPIC_HH_VIRT: u64 = 0xFFFF_FFFF_FEE0_0000;
 
@@ -313,6 +368,10 @@ pub unsafe fn init() {
     // Also keep identity mapping for early code that uses the low address
     map_page(phys as *mut u64, 0xFEE00000, 0xFEE00000, PTE_WRITABLE | PTE_CACHE_DISABLE);
     uart_print("[VM] LAPIC mapped\r\n");
+    // IOAPIC (обычно 0xFEC00000): маппим заранее для будущего IRQ-routing.
+    // Безопасно даже если IOAPIC нет — просто резерв страницы.
+    map_page(phys as *mut u64, 0xFEC00000, 0xFEC00000, PTE_WRITABLE | PTE_CACHE_DISABLE);
+    uart_print("[VM] IOAPIC reserved\r\n");
 
     // Make the page table area (2MB at 0xF800000) writable so that
     // heap::init and other code can modify page tables after WP is re-enabled.

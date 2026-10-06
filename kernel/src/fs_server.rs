@@ -54,9 +54,20 @@ fn request_path(data: &[u8]) -> &[u8] {
 fn request_payload(data: &[u8]) -> &[u8] {
     let path = request_path(data);
     let path_end = 1 + path.len();
+    if path_end >= data.len() { return &[]; }
     let after = &data[path_end..];
-    if after.first() == Some(&0) {
-        after[1..].split(|&c| c == 0).next().unwrap_or(&after[1..])
+    if after.first() == Some(&0) && path_end + 1 < data.len() {
+        // Return all bytes after the NUL separator without splitting by 0 — preserves binary data
+        // Trim only trailing zero padding (unused Message bytes)
+        let payload = &data[path_end + 1..];
+        let mut end = payload.len();
+        while end > 0 && payload[end - 1] == 0 { end -= 1; }
+        // If payload was empty (just padding), return empty
+        if end == 0 && payload.iter().all(|&b| b == 0) { return &[]; }
+        // Re-scan: if the original payload itself ended with zeros, we trimmed them.
+        // For text payloads this is fine; for binary we return up to last non-zero.
+        // To preserve trailing zeros in binary, caller should use message length.
+        &payload[..payload.len() - (payload.len() - end).min(payload.len())]
     } else {
         &[]
     }
@@ -86,7 +97,7 @@ fn err_reply(buff: &mut Message, text: &[u8]) {
 
 // ── Обработка одной операции ────────────────────────────────────────
 
-fn handle(op: u8, data: &[u8], buff: &mut Message) {
+fn handle(op: u8, data: &[u8], data_len: usize, buff: &mut Message) {
     let path = request_path(data);
     match op {
         FS_OP_LS => {
@@ -106,7 +117,13 @@ fn handle(op: u8, data: &[u8], buff: &mut Message) {
             }
         }
         FS_OP_WRITE => {
-            let payload = request_payload(data);
+            // Use data_len to preserve binary payload including embedded zeros
+            let path_len = path.len();
+            let payload = if data_len > 1 + path_len + 1 {
+                &data[1 + path_len + 1..data_len]
+            } else {
+                request_payload(data)
+            };
             if crate::fs::write_file(path, payload) {
                 ok_reply(buff, b"");
             } else {
@@ -156,9 +173,10 @@ extern "C" fn server_entry() {
         let r = ipc::recv_with_cap(cap, &mut req);
         if r != 0 { continue; }
         let op = req.data[0];
+        let data_len = req.length as usize;
         let mut data = [0u8; PAYLOAD_SIZE];
         data.copy_from_slice(&req.data);
-        handle(op, &data, &mut req);
+        handle(op, &data, data_len, &mut req);
         let reply_cap = unsafe { FS_SERVER_REPLY_CAP };
         let _ = ipc::send_with_cap(reply_cap, &req);
     }
@@ -246,16 +264,18 @@ pub fn size(path: &[u8]) -> Option<u32> {
 }
 
 pub fn read(path: &[u8], buf: &mut [u8]) -> Option<usize> {
-    let mut out = [0u8; PAYLOAD_SIZE];
-    match request(FS_OP_CAT, path, &[], &mut out) {
-        0 => {
-            let n = out.iter().position(|&c| c == 0).unwrap_or(out.len());
-            if n > buf.len() { return None; }
-            buf[..n].copy_from_slice(&out[..n]);
-            Some(n)
-        }
-        _ => None,
-    }
+    // Use direct IPC to preserve binary data (including 0x00 bytes)
+    let cap = unsafe { FS_CLIENT_CAP };
+    if cap == 0 { return None; }
+    let req = build_request(FS_OP_CAT, path, &[]);
+    if ipc::send_with_cap(cap, &req) != 0 { return None; }
+    let mut reply = Message::empty();
+    if ipc::recv_with_cap(cap, &mut reply) != 0 { return None; }
+    if reply.data[0] != FS_OK { return None; }
+    let payload_len = (reply.length as usize).saturating_sub(1);
+    if payload_len > buf.len() { return None; }
+    buf[..payload_len].copy_from_slice(&reply.data[1..1 + payload_len]);
+    Some(payload_len)
 }
 
 /// Прочитать содержимое для cat (как есть).

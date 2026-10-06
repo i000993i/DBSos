@@ -143,3 +143,23 @@ pub const SIG_TERM: u64 = 15;
 /// Флаги IPC
 pub const IPC_NONBLOCK: u64 = 1 << 0;
 pub const IPC_SHMEM: u64 = 1 << 1;
+
+/// Multi-user syscalls
+pub const SYS_GETUID: u64 = 60;
+pub const SYS_GETGID: u64 = 61;
+pub const SYS_SETUID: u64 = 62;
+pub const SYS_CHMOD: u64 = 63;
+pub const SYS_CHOWN: u64 = 64;
+
+/// Wayland syscalls (syscall-based, no socket)
+pub const SYS_WL_SHM_CREATE: u64 = 70;
+pub const SYS_WL_SHM_DESTROY: u64 = 71;
+pub const SYS_WL_SURFACE_CREATE: u64 = 72;
+pub const SYS_WL_SURFACE_DESTROY: u64 = 73;
+pub const SYS_WL_SURFACE_ATTACH: u64 = 74;
+pub const SYS_WL_SURFACE_COMMIT: u64 = 75;
+pub const SYS_WL_SURFACE_SET_POS: u64 = 76;
+
+/// DBS-GR Ring3 framebuffer
+pub const SYS_FB_INFO: u64 = 77;
+pub const SYS_FB_MAP: u64 = 78;

@@ -1,17 +1,19 @@
 use super::uart;
 use core::ptr::{read_volatile, write_volatile};
 
-const SATA_VENDOR: u16 = 0x8086;
-const SATA_DEVICE: u16 = 0x2922;
+const _SATA_VENDOR: u16 = 0x8086;
+const _SATA_DEVICE: u16 = 0x2922;
 
 const HBA_GHC: u64 = 0x0004;
 const GHC_AE: u32 = 0x8000_0000;
-const GHC_HR: u32 = 0x0000_0001;
+const _GHC_HR: u32 = 0x0000_0001;
 
 const CAP_NP: u32 = 0x1F;
 
 static mut AHCI_BASE: u64 = 0;
 static mut PORT_INIT: bool = false;
+// Рабочий порт (лог доказал: init мог выбрать p>0, а do_command всегда бил в 0)
+static mut PORT_N: u32 = 0;
 static mut CLB_PHYS: u64 = 0;
 static mut CT_PHYS: u64 = 0;
 
@@ -26,18 +28,36 @@ pub static mut FATS: u8 = 2;
 pub static mut IS_FAT32: bool = false;
 pub static mut ROOT_CLUSTER: u64 = 0;
 fn find_ahci() -> bool {
+    // Generic: любой PCI class 01h subclass 06h (SATA/AHCI), не только 8086:2922.
+    // QEMU q35 даёт 8086:2922, но на железе встречаются 8086:2829/2822/8c02,
+    // 1022:7801, 1b4b:9172 и т.д. Проверяем BAR5 и class, а не VID/DID.
     for dev in 0..32 {
         for func in 0..8 {
             let v = super::pci::read16(0, dev as u8, func as u8, 0);
-            if v != SATA_VENDOR { if func == 0 { break; } continue; }
-            let d = super::pci::read16(0, dev as u8, func as u8, 2);
-            if d != SATA_DEVICE { continue; }
+            if v == 0xFFFF { if func == 0 { break; } continue; }
             let r = super::pci::read32(0, dev as u8, func as u8, 8);
-            if (r >> 24) as u8 == 1 && ((r >> 16) & 0xFF) as u8 == 6 {
-                let bar5 = super::pci::read32(0, dev as u8, func as u8, 0x24);
-                unsafe { AHCI_BASE = (bar5 & 0xFFFFFFF0) as u64; }
-                return true;
-            }
+            let class = (r >> 24) as u8;
+            let subclass = ((r >> 16) & 0xFF) as u8;
+            if class != 0x01 || subclass != 0x06 { continue; }
+            // Пропускаем IDE-legacy в том же классе (subclass 01) — уже отсеяно выше.
+            let bar5 = super::pci::read32(0, dev as u8, func as u8, 0x24);
+            let base = (bar5 & 0xFFFF_FFF0) as u64;
+            if base == 0 { continue; }
+            // BAR5 должен быть MEM (bit0=0), не I/O
+            if bar5 & 1 != 0 { continue; }
+            unsafe { AHCI_BASE = base; }
+            // Включить MEM + BusMaster: без MASTER HBA не может делать DMA
+            // (CI висел с TFD=0x50 — команда не забиралась). Как в NVMe-драйвере.
+            let cmd = super::pci::read16(0, dev as u8, func as u8, 0x04);
+            super::pci::write32(0, dev as u8, func as u8, 0x04, (cmd | 0x6) as u32);
+            uart::write_str("[AHCI] found PCI ");
+            uart_hex32(v as u32);
+            uart::write_str(":");
+            uart_hex32(super::pci::read16(0, dev as u8, func as u8, 2) as u32);
+            uart::write_str(" BAR5=");
+            uart_hex32(bar5);
+            uart::write_str("\r\n");
+            return true;
         }
     }
     false
@@ -68,9 +88,18 @@ fn wr_p_ie(p: u64, v: u32) { wr32(p + 0x14, v) }
 fn spin_until(mut f: impl FnMut() -> bool, max_us: u64) -> bool {
     use crate::timer;
     let start = timer::ticks();
+    // Гибрид: таймер (HPET) + жёсткий кап итераций, чтобы не висеть если таймер не готов.
+    // 100k итераций ~ единицы мс на spin_loop; кап 20M итераций гарантирует выход.
+    let mut iter: u64 = 0;
+    const ITER_CAP: u64 = 20_000_000;
     while !f() {
-        if timer::ticks().wrapping_sub(start) > max_us * 10 {
-            return false;
+        iter += 1;
+        if iter >= ITER_CAP { return false; }
+        // Проверяем таймер только каждые 1024 итерации (дешевле)
+        if (iter & 1023) == 0 && max_us > 0 {
+            if timer::ticks().wrapping_sub(start) > max_us * 10 {
+                return false;
+            }
         }
         core::hint::spin_loop();
     }
@@ -101,7 +130,16 @@ fn port_init(port: u32) -> bool {
     // Stop port: clear ST (bit 0) and FRE (bit 4)
     let cmd = p_cmd(pb);
     wr_p_cmd(pb, cmd & !(1 | (1 << 4)));
-    spin_until(|| (p_cmd(pb) & 0xC000_0000) == 0, 100_000); // wait for FR+CR to clear
+    // Ждём FR(bit14)+CR(bit15) == 0. Маска 0xC000, НЕ 0xC000_0000 (был баг — вечное ожидание).
+    if !spin_until(|| (p_cmd(pb) & 0xC000) == 0, 500_000) {
+        uart::write_str("[AHCI] port stop timeout\r\n");
+        // Продолжаем: QEMU иногда держит CR — переинициализация всё равно пробуется
+    }
+
+    // Чистим залипшие SATA-ошибки ДО старта (раньше чистили после — ERR мог
+    // блокировать первую команду и давать вечный CI=1).
+    wr32(pb + 0x10, 0xFFFFFFFF); // PxIS
+    wr32(pb + 0x30, 0xFFFFFFFF); // PxSERR (W1C)
 
     // Set our DMA base addresses
     wr_p_clb(pb, clb_phys as u32);
@@ -113,14 +151,19 @@ fn port_init(port: u32) -> bool {
     wr_p_ie(pb, 0);
     wr_p_cmd(pb, 0x0017);
 
-    spin_until(|| (p_cmd(pb) & 0xC000_0000) == 0xC000_0000, 100_000); // wait for FR+CR
+    // Ждём FR+CR == 1 (биты 14,15). Bounded 500ms — дальше не висим.
+    if !spin_until(|| (p_cmd(pb) & 0xC000) == 0xC000, 500_000) {
+        uart::write_str("[AHCI] port start timeout (FR/CR not ready)\r\n");
+        return false;
+    }
 
-    // Clear interrupts
+    // Clear interrupts (SERR уже чист сверху)
     wr32(pb + 0x10, 0xFFFFFFFF);
 
     unsafe {
         CLB_PHYS = clb_phys;
         CT_PHYS = ct_phys;
+        PORT_N = port;
         let hdr = clb_phys as *mut u32;
         write_volatile(hdr, (5 << 0) | (1 << 16));
         write_volatile(hdr.add(2), ct_phys as u32);
@@ -143,7 +186,8 @@ fn build_read_fis(lba: u64, count: u16) -> [u32; 5] {
 
 fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
     if !unsafe { PORT_INIT } { return false; }
-    let pb = port_base(0);
+    // Порт, прошедший port_init (НЕ хардкод 0 — иначе бьём в мёртвый порт)
+    let pb = port_base(unsafe { PORT_N });
 
     // Wait for port idle
     if !spin_until(|| (p_ci(pb) & 1) == 0, 10_000) {
@@ -180,12 +224,15 @@ fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
     // Clear port interrupts
     wr32(pb + 0x10, 0xFFFFFFFF);
 
-    // Flush CPU cache so HBA sees our CLB/CT/PRDT writes
-    // On QEMU wbinvd can trigger #DB; use clflush per-line instead
+    // Flush CPU cache so HBA sees our CLB/CT/PRDT writes.
+    // Раньше флашился только CT — HBA мог читать stale Command Header
+    // (CLB) и игнорировать команду: вечный CI=1 при готовом TFD.
+    // On QEMU wbinvd can trigger #DB; use clflush per-line instead.
     {
-        let base = ct_addr;
-        for i in (0..(4096u64)).step_by(64) {
-            unsafe { core::arch::asm!("clflush [{}]", in(reg) base + i); }
+        for base in [clb, ct_addr] {
+            for i in (0..(1024u64)).step_by(64) {
+                unsafe { core::arch::asm!("clflush [{}]", in(reg) base + i); }
+            }
         }
     }
 
@@ -197,9 +244,15 @@ fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
         let tfd = p_tfd(pb);
         let ci = p_ci(pb);
         let is = p_is(pb);
+        let serr = reg32(pb + 0x30);
+        let ssts = p_ssts(pb);
+        let sig = p_sig(pb);
         uart::write_str("[AHCI] timeout! CI="); uart_hex32(ci);
         uart::write_str(" TFD=0x"); uart_hex32(tfd);
         uart::write_str(" IS=0x"); uart_hex32(is);
+        uart::write_str(" SERR=0x"); uart_hex32(serr);
+        uart::write_str(" SSTS=0x"); uart_hex32(ssts);
+        uart::write_str(" SIG=0x"); uart_hex32(sig);
         uart::write_str("\r\n");
         return false;
     }
@@ -216,18 +269,46 @@ fn do_command(_cmd: u8, fis4: [u32; 5], buf: *mut u8, count: u16) -> bool {
 }
 
 pub fn init() {
-    if !find_ahci() { return; }
+    if !find_ahci() { uart::write_str("[AHCI] no HBA (class 01/06 not found)\r\n"); return; }
+    if unsafe { AHCI_BASE } == 0 { uart::write_str("[AHCI] BAR5=0, skip\r\n"); return; }
 
-    let ghc = reg32(HBA_GHC);
-    if ghc & GHC_AE == 0 {
-        wr32(HBA_GHC, GHC_HR);
-        spin_until(|| (reg32(HBA_GHC) & GHC_HR) == 0, 1_000);
-        wr32(HBA_GHC, GHC_AE);
+    // BIOS/OS Handoff (BOHC @ 0x28): забрать владение у UEFI/BIOS.
+    // Без этого порт может остаться под контролем firmware и команды висят.
+    {
+        let bohc = reg32(0x28);
+        // BOHC: bit0 BOS, bit1 OOS, bit4 BB. Запрашиваем OOS.
+        if bohc & 0x02 == 0 {
+            wr32(0x28, bohc | 0x02);
+            // Ждём bounded: максимум ~1с, иначе продолжаем (QEMU BOHC может отсутствовать)
+            let _ = spin_until(|| (reg32(0x28) & 0x10) == 0, 1_000_000);
+        }
     }
 
-    // Detect number of ports
+    // HBA reset только если AE уже поднят и контроллер в странном состоянии.
+    // Полный HR сбрасывает PI и может уронить QEMU ICH9 — делаем мягко.
+    let ghc = reg32(HBA_GHC);
+    if ghc & GHC_AE == 0 {
+        wr32(HBA_GHC, GHC_AE);
+        // AE должен подняться сразу; bounded wait 100ms
+        if !spin_until(|| (reg32(HBA_GHC) & GHC_AE) != 0, 100_000) {
+            uart::write_str("[AHCI] AE enable timeout\r\n");
+            return;
+        }
+    } else {
+        // Staggered spin-up: включаем SUD на всех реализованных портах
+        let pi = reg32(0x0C);
+        for p in 0..8u32 {
+            if (pi >> p) & 1 == 0 { continue; }
+            let pb = port_base(p);
+            let cmd = p_cmd(pb);
+            // POD (bit2) + SUD (bit1): раскрутить устройство
+            wr_p_cmd(pb, cmd | 0x06);
+        }
+    }
+
+    // Detect number of ports (кап 8 — дальше только трата времени)
     let cap = reg32(0x00);
-    let n_ports = (cap & CAP_NP) + 1;
+    let n_ports = ((cap & CAP_NP) + 1).min(8);
     let pi = reg32(0x0C);
 
     // Try to find a port with a device
@@ -238,18 +319,33 @@ pub fn init() {
     if !found { for p in 1..n_ports { if (pi >> p) & 1 != 0 { if port_init(p) { found = true; break; } } } }
 
     if !found { uart::write_str("[AHCI] no device\r\n"); return; }
+    uart::write_str("[AHCI] using port ");
+    uart_dec(unsafe { PORT_N } as u64);
+    uart::write_str("\r\n");
 
     // Read MBR via AHCI DMA
     let mbr_phys = crate::memory::palloc();
     if mbr_phys == 0 { return; }
     unsafe { core::ptr::write_bytes(mbr_phys as *mut u8, 0, 4096); }
-    if !read_sectors(0, 1, mbr_phys as *mut u8) { crate::memory::pfree(mbr_phys); return; }
+    if !read_sectors(0, 1, mbr_phys as *mut u8) {
+        crate::memory::pfree(mbr_phys);
+        uart::write_str("[AHCI] MBR read failed (DMA timeout, no usable disk)\r\n");
+        return;
+    }
 
-    let mbr = unsafe { core::slice::from_raw_parts(mbr_phys as *const u8, 512) };
-    let sig = (mbr[0x1FE] as u16) | ((mbr[0x1FF] as u16) << 8);
+    // Read MBR via AHCI DMA; весь разбор — в скоупе, чтобы pfree не конфликтовал с заимствованием.
+    let (sig, b0, ptype, pstart) = {
+        let mbr = unsafe { core::slice::from_raw_parts(mbr_phys as *const u8, 512) };
+        let sig = (mbr[0x1FE] as u16) | ((mbr[0x1FF] as u16) << 8);
+        let b0 = mbr[0];
+        let ptype = mbr[0x1C2];
+        let pstart = (mbr[0x1C6] as u32) | ((mbr[0x1C7] as u32) << 8) |
+                     ((mbr[0x1C8] as u32) << 16) | ((mbr[0x1C9] as u32) << 24);
+        (sig, b0, ptype, pstart)
+    };
 
     if sig != 0xAA55 {
-        if mbr[0] == 0xEB || mbr[0] == 0xE9 {
+        if b0 == 0xEB || b0 == 0xE9 {
             unsafe { PART_LBA = 0; }
             parse_fat_bpb_from(mbr_phys);
         }
@@ -257,11 +353,27 @@ pub fn init() {
         return;
     }
 
-    let ptype = mbr[0x1C2];
-    let pstart = (mbr[0x1C6] as u32) | ((mbr[0x1C7] as u32) << 8) |
-                 ((mbr[0x1C8] as u32) << 16) | ((mbr[0x1C9] as u32) << 24);
+    // GPT protective MBR: ищем партицию через GPT header (LBA1)
+    if ptype == 0xEE {
+        if let Some(gpt_lba) = gpt_first_lba() {
+            unsafe { PART_LBA = gpt_lba; }
+            crate::memory::pfree(mbr_phys);
+            let vbr_phys = crate::memory::palloc();
+            if vbr_phys == 0 { return; }
+            unsafe { core::ptr::write_bytes(vbr_phys as *mut u8, 0, 4096); }
+            if !read_sectors(gpt_lba, 1, vbr_phys as *mut u8) { crate::memory::pfree(vbr_phys); return; }
+            parse_fat_bpb_from(vbr_phys);
+            crate::memory::pfree(vbr_phys);
+            uart::write_str("[AHCI] GPT part LBA="); uart_dec(gpt_lba);
+            uart::write_str("\r\n");
+            return;
+        }
+        crate::memory::pfree(mbr_phys);
+        uart::write_str("[AHCI] GPT parse failed\r\n");
+        return;
+    }
 
-    if ptype == 0 || ptype == 0xEE || !is_fat_type(ptype) {
+    if ptype == 0 || !is_fat_type(ptype) {
         crate::memory::pfree(mbr_phys);
         return;
     }
@@ -279,6 +391,42 @@ pub fn init() {
 }
 
 fn is_fat_type(pt: u8) -> bool { matches!(pt, 0x01|0x04|0x06|0x07|0x0B|0x0C|0x0E|0x1B|0x1C) }
+
+/// GPT: header LBA1 -> entries -> первая usable партиция. Bounded, без зависаний.
+fn gpt_first_lba() -> Option<u64> {
+    let hdr_phys = crate::memory::palloc();
+    if hdr_phys == 0 { return None; }
+    unsafe { core::ptr::write_bytes(hdr_phys as *mut u8, 0, 4096); }
+    if !read_sectors(1, 1, hdr_phys as *mut u8) { crate::memory::pfree(hdr_phys); return None; }
+    let parsed = {
+        let hdr = unsafe { &*(hdr_phys as *const [u8; 512]) };
+        crate::gpt::parse_header(hdr)
+    };
+    crate::memory::pfree(hdr_phys);
+    let (entry_lba, entry_num, entry_size) = parsed?;
+    let total_bytes = (entry_num as u64) * (entry_size as u64);
+    let sectors = ((total_bytes + 511) / 512).min(32) as u16;
+    if sectors == 0 { return None; }
+    // Читаем первые entries (хватает для первой партиции) в один 4K буфер
+    let buf_phys = crate::memory::palloc();
+    if buf_phys == 0 { return None; }
+    unsafe { core::ptr::write_bytes(buf_phys as *mut u8, 0, 4096); }
+    let want = sectors.min(8) as u64; // 8 секторов = 4KB
+    for s in 0..want {
+        let t = crate::memory::palloc();
+        if t == 0 { crate::memory::pfree(buf_phys); return None; }
+        if !read_sectors(entry_lba + s, 1, t as *mut u8) { crate::memory::pfree(t); crate::memory::pfree(buf_phys); return None; }
+        unsafe { core::ptr::copy_nonoverlapping(t as *const u8, (buf_phys + s * 512) as *mut u8, 512); }
+        crate::memory::pfree(t);
+    }
+    let copy_len = (want as usize * 512).min(4096);
+    let result = {
+        let flat = unsafe { core::slice::from_raw_parts(buf_phys as *const u8, copy_len) };
+        crate::gpt::first_partition_lba(flat, entry_num, entry_size)
+    };
+    crate::memory::pfree(buf_phys);
+    result
+}
 
 fn parse_fat_bpb_from(phys: u64) {
     let bpb = unsafe { &*(phys as *const [u8; 512]) };
@@ -315,6 +463,11 @@ fn parse_fat_bpb_from(phys: u64) {
 pub fn read_sectors(lba: u64, count: u16, buf: *mut u8) -> bool {
     do_command(0x25, build_read_fis(lba, count), buf, count)
 }
+
+/// Готов ли порт (для block-слоя и probe).
+pub fn is_ready() -> bool { unsafe { PORT_INIT } }
+
+pub fn part_lba() -> u64 { unsafe { PART_LBA } }
 
 fn build_write_fis(lba: u64, count: u16) -> [u32; 5] {
     [

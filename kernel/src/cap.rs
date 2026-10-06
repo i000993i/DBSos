@@ -90,11 +90,15 @@ pub fn transfer(dst_task_id: u64, cap_idx: u16) -> i64 {
     let src_slot = current_slot();
     let cap = unsafe { CAP_TABLES[src_slot].get(cap_idx) };
     let cap = match cap { Some(c) => *c, None => return IPC_ERR_BAD_CAP };
-
+    let src_uid = unsafe { crate::scheduler::TASKS[src_slot].uid };
     let dst_slot = match slot_for_task(dst_task_id) {
         Some(s) => s,
         None => return IPC_ERR_NO_SERVER,
     };
+    let dst_uid = unsafe { crate::scheduler::TASKS[dst_slot].uid };
+    if src_uid != 0 && src_uid != dst_uid {
+        return IPC_ERR_DENIED;
+    }
 
     unsafe {
         match CAP_TABLES[dst_slot].alloc(cap.cap_type, cap.server_id, cap.rights, cap.data) {
@@ -114,10 +118,16 @@ pub fn duplicate(dst_task_id: u64, cap_idx: u16) -> i64 {
         Some(c) => *c,
         None => return IPC_ERR_BAD_CAP,
     };
+    // Multi-user hardening: only owner or root can share caps across users
+    let src_uid = unsafe { crate::scheduler::TASKS[current_slot()].uid };
     let dst_slot = match slot_for_task(dst_task_id) {
         Some(s) => s,
         None => return IPC_ERR_NO_SERVER,
     };
+    let dst_uid = unsafe { crate::scheduler::TASKS[dst_slot].uid };
+    if src_uid != 0 && src_uid != dst_uid {
+        return IPC_ERR_DENIED;
+    }
     unsafe {
         match CAP_TABLES[dst_slot].alloc(cap.cap_type, cap.server_id, cap.rights, cap.data) {
             Some(_) => IPC_OK,

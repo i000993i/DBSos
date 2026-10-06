@@ -3,7 +3,7 @@
 
 use super::{ELF_MAGIC, EI_CLASS, EI_DATA, ELFCLASS64, ELFDATA2LSB,
             ET_EXEC, ET_DYN, EM_X86_64, PT_LOAD, PT_INTERP,
-            LINUX_MMAP_BASE, LINUX_STACK_TOP};
+            randomize_mmap_base, randomize_stack_top};
 use crate::memory::{self, palloc, palloc_n, PAGE_SIZE};
 use crate::vm;
 
@@ -50,6 +50,7 @@ pub struct LinuxProgram {
     pub interp_vaddr: u64,
     pub interp_size: u64,
     pub stack_size: u64,
+    pub stack_top: u64,
 }
 
 pub fn load_linux_elf(elf_data: &[u8]) -> Result<LinuxProgram, &'static str> {
@@ -88,8 +89,10 @@ pub fn load_linux_elf(elf_data: &[u8]) -> Result<LinuxProgram, &'static str> {
     unsafe {
         let current = vm::current_pml4() as *mut u64;
         vm::clone_high_half(current, pml4);
-        vm::identity_map_2mb(pml4, 0, 0x1_0000_0000,
-            vm::PTE_WRITABLE | vm::PTE_USER | vm::PTE_GLOBAL);
+        // Map only the low 1MB for BIOS/video structures — NOT the entire 4GB.
+        // Each ELF segment gets its own specific physical pages mapped below.
+        vm::identity_map_2mb(pml4, 0, 0x100_000,
+            vm::PTE_WRITABLE | vm::PTE_USER);
     }
 
     let mut max_vaddr: u64 = 0;
@@ -153,7 +156,7 @@ pub fn load_linux_elf(elf_data: &[u8]) -> Result<LinuxProgram, &'static str> {
         if vaddr + memsz > max_vaddr { max_vaddr = vaddr + memsz; }
     }
 
-    // Allocate user stack (64KB)
+    // Allocate user stack (64KB) — randomized location (ASLR)
     let stack_pages = 16;
     let stack_phys = palloc_n(stack_pages);
     if stack_phys == 0 { return Err("Failed to allocate stack"); }
@@ -162,7 +165,8 @@ pub fn load_linux_elf(elf_data: &[u8]) -> Result<LinuxProgram, &'static str> {
         memory::memset_phys(stack_phys + (i as u64) * PAGE_SIZE as u64, 0, PAGE_SIZE);
     }
 
-    let stack_virt_bottom = LINUX_STACK_TOP - (stack_pages as u64 * PAGE_SIZE as u64);
+    let stack_top = randomize_stack_top();
+    let stack_virt_bottom = stack_top - (stack_pages as u64 * PAGE_SIZE as u64);
     for i in 0..stack_pages {
         let phys = stack_phys + (i as u64) * PAGE_SIZE as u64;
         let virt = stack_virt_bottom + (i as u64) * PAGE_SIZE as u64;
@@ -219,10 +223,11 @@ pub fn load_linux_elf(elf_data: &[u8]) -> Result<LinuxProgram, &'static str> {
         code_phys: first_code_phys,
         stack_phys,
         brk,
-        mmap_base: LINUX_MMAP_BASE,
+        mmap_base: randomize_mmap_base(),
         phdr_vaddr,
         interp_vaddr,
         interp_size,
         stack_size: stack_pages as u64 * PAGE_SIZE as u64,
+        stack_top,
     })
 }

@@ -49,8 +49,9 @@ pub unsafe fn emit_mmio_read32(dst: *mut u8, off: usize, dst_reg: u8, base: u8, 
 
 pub unsafe fn emit_print(dst: *mut u8, off: usize, str_addr: u64, len: u32) -> usize {
     let mut p = off;
-    p += emit_mov_imm64(dst, p, 2, str_addr);
-    p += emit_mov_imm32(dst, p, 8, len);
+    // Пользовательский ABI: rax=num, arg1=rdi, arg2=rsi, arg3=rdx, arg4=r10
+    p += emit_mov_imm64(dst, p, 7, str_addr);
+    p += emit_mov_imm32(dst, p, 6, len);
     p += emit_mov_imm32(dst, p, 0, 20);
     p += emit_syscall(dst, p);
     p - off
@@ -58,9 +59,9 @@ pub unsafe fn emit_print(dst: *mut u8, off: usize, str_addr: u64, len: u32) -> u
 
 pub unsafe fn emit_syscall3(dst: *mut u8, off: usize, num: u64, arg1: u64, arg2: u64, arg3: u64) -> usize {
     let mut p = off;
-    p += emit_mov_imm64(dst, p, 8, arg2);
-    p += emit_mov_imm64(dst, p, 9, arg3);
-    p += emit_mov_imm64(dst, p, 2, arg1);
+    p += emit_mov_imm64(dst, p, 6, arg2);
+    p += emit_mov_imm64(dst, p, 2, arg3);
+    p += emit_mov_imm64(dst, p, 7, arg1);
     p += emit_mov_imm64(dst, p, 0, num);
     p += emit_syscall(dst, p);
     p - off

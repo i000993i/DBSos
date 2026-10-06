@@ -1,2 +1,9 @@
-[build]
-target = "x86_64-unknown-uefi"
+# Целевую архитектуру здесь НЕ задаём: глобальный build.target = "x86_64-unknown-uefi"
+# ломает `cargo test`/`cargo clippy` (тест-харнесс и lints должны идти на host,
+# а для UEFI-таргета нет запускаемого тест-бинаря).
+#
+# Образ ядра собирается с явным таргетом:
+#   cargo build -p dbsos-kernel --target x86_64-unknown-uefi
+#
+# Прямое `cargo build` без --target для kernel/servers на host не линкуется
+# (это no_std-образы без host crt) — это ожидаемо.

@@ -40,8 +40,31 @@ unsafe fn write_user_msg(ptr: *mut Message, msg: &Message) {
     smap_enable();
 }
 
+/// Проверка user-буфера перед копированием: EFAULT вместо #PF.
+/// Для ядерных задач (pml4 null) — пропуск (старое поведение).
+#[inline(always)]
+unsafe fn user_range_ok(ptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let cur = crate::scheduler::CURRENT;
+    let pml4 = crate::scheduler::TASKS[cur].pml4;
+    if pml4.is_null() {
+        return true;
+    }
+    crate::vm::is_user_range_mapped(pml4, ptr, len)
+}
+
 #[no_mangle]
 unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    // Linux ABI роутинг: задача, привязанная к живому LinuxTask, говорит
+    // Linux-номерами (0=read, 1=write, 60=exit...), а не DBSos-номерами.
+    // Раньше такие вызовы падали в native match и ломались.
+    // Регистры совпадают для первых 4 аргументов (rdi,rsi,rdx,r10); a5/a6=0
+    // (все реализованные хендлеры их игнорируют: mmap anon, clone=fork).
+    if let Some(lt) = crate::linux::task::get_current() {
+        return crate::linux::syscall::handle_syscall(lt, num, arg1, arg2, arg3, arg4, 0, 0) as u64;
+    }
     match num {
         SYS_EXIT => {
             crate::driver::uart::write_str("[SYSCALL] exit\r\n");
@@ -84,6 +107,7 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
         SYS_LOG_WRITE => {
             let ptr = arg1 as *const u8;
             let len = arg2 as usize;
+            if !user_range_ok(ptr as u64, len) { return !0u64; }
             let mut buf = [0u8; 256];
             let copy_len = len.min(256);
             smap_disable();
@@ -246,6 +270,8 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             let remaining = size.saturating_sub(offset) as usize;
             let to_read = count.min(remaining);
             if to_read == 0 { return 0; }
+            // EFAULT вместо #PF на кривом user-буфере
+            if !user_range_ok(buf_ptr as u64, to_read) { return !0u64; }
             // Read via VFS
             let mut kernel_buf = [0u8; 4096];
             let read_chunk = to_read.min(4096);
@@ -279,6 +305,8 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             let fds = &crate::scheduler::TASKS[cur].fds;
             if fd_idx >= fds.len() || !fds[fd_idx].in_use { return !0u64; }
             if fds[fd_idx].flags & O_WRONLY == 0 && fds[fd_idx].flags & O_RDWR == 0 { return !0u64; }
+            // EFAULT вместо #PF на кривом user-буфере
+            if !user_range_ok(buf_ptr as u64, count) { return !0u64; }
             let path_len = fds[fd_idx].path.iter().position(|&c| c == 0).unwrap_or(128);
             let offset = fds[fd_idx].offset as u64;
             // Read data from user
@@ -347,6 +375,10 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             unsafe {
                 let cur = CURRENT;
                 let cur_id = TASKS[cur].id;
+                let cur_uid = TASKS[cur].uid;
+                if cur_uid != 0 && crate::scheduler::task_count_for_uid(cur_uid) >= crate::scheduler::MAX_TASKS_PER_USER {
+                    return !0u64;
+                }
 
                 // Find free task slot
                 let slot = match (0..crate::scheduler::MAX_TASKS).find(|&i| TASKS[i].state == TaskState::Free) {
@@ -423,7 +455,7 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                 let new_id = NEXT_ID;
                 NEXT_ID += 1;
 
-                // Create child task
+                // Create child task — inherit uid/gid/cwd
                 TASKS[slot] = crate::scheduler::Task {
                     state: TaskState::Ready,
                     stack_base: new_kstack as *mut u8,
@@ -445,6 +477,10 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
                     fds: new_fds,
                     vmas: [const { crate::scheduler::vma::Vma::empty() }; crate::scheduler::vma::MAX_VMAS],
                     vma_count: 0,
+                    uid: TASKS[cur].uid,
+                    gid: TASKS[cur].gid,
+                    cwd: TASKS[cur].cwd,
+                    cwd_len: TASKS[cur].cwd_len,
                 };
 
                 // Copy FPU state
@@ -943,6 +979,155 @@ unsafe extern "C" fn syscall_rust_entry(num: u64, arg1: u64, arg2: u64, arg3: u6
             crate::driver::tcp::close(conn_idx);
             let cur_fds = &mut crate::scheduler::TASKS[cur].fds;
             cur_fds[fd_idx] = crate::scheduler::FdEntry::empty();
+            0
+        }
+
+        SYS_GETUID => {
+            crate::user::current_uid() as u64
+        }
+        SYS_GETGID => {
+            crate::user::current_gid() as u64
+        }
+        SYS_SETUID => {
+            let uid = arg1 as u32;
+            // Only root can setuid
+            if crate::user::current_uid() != 0 { return !0u64; }
+            if crate::user::find_by_uid(uid).is_none() && uid != 0 { return !0u64; }
+            crate::user::set_current_uid(uid);
+            0
+        }
+        SYS_CHMOD => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let mode = arg3 as u16;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            if crate::user::current_uid() != 0 {
+                // Only owner or root can chmod
+                let mut path = [0u8; 128];
+                smap_disable();
+                for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+                smap_enable();
+                let perm = crate::permissions::get(&path[..path_len]);
+                if perm.owner != crate::user::current_uid() { return !0u64; }
+                crate::permissions::set(&path[..path_len], crate::permissions::Perm { owner: perm.owner, group: perm.group, mode: mode & 0o777 });
+                return 0;
+            }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            let perm = crate::permissions::get(&path[..path_len]);
+            crate::permissions::set(&path[..path_len], crate::permissions::Perm { owner: perm.owner, group: perm.group, mode: mode & 0o777 });
+            0
+        }
+        SYS_CHOWN => {
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let owner = arg3 as u32;
+            let group = arg4 as u32;
+            if path_len == 0 || path_len > 127 { return !0u64; }
+            if crate::user::current_uid() != 0 { return !0u64; }
+            smap_disable();
+            let mut path = [0u8; 128];
+            for i in 0..path_len { path[i] = core::ptr::read_volatile(path_ptr.add(i)); }
+            smap_enable();
+            let perm = crate::permissions::get(&path[..path_len]);
+            crate::permissions::set(&path[..path_len], crate::permissions::Perm { owner, group, mode: perm.mode });
+            0
+        }
+
+        SYS_WL_SHM_CREATE => {
+            let size = arg1 as usize;
+            match crate::wayland::shm::pool_create(size) {
+                Some(idx) => idx as u64,
+                None => !0u64,
+            }
+        }
+        SYS_WL_SHM_DESTROY => {
+            let idx = arg1 as usize;
+            if crate::wayland::shm::pool_destroy(idx) { 0 } else { !0u64 }
+        }
+        SYS_WL_SURFACE_CREATE => {
+            let x = arg1 as i32;
+            let y = arg2 as i32;
+            let w = arg3 as u32;
+            let h = arg4 as u32;
+            if w==0 || h==0 || w>2048 || h>2048 { return !0u64; }
+            match crate::wayland::compositor::surface_create(x, y, w, h) {
+                Some(id) => id as u64,
+                None => !0u64,
+            }
+        }
+        SYS_WL_SURFACE_DESTROY => {
+            let id = arg1 as u32;
+            if crate::wayland::compositor::surface_destroy(id) { 0 } else { !0u64 }
+        }
+        SYS_WL_SURFACE_ATTACH => {
+            let id = arg1 as u32;
+            let pool = arg2 as usize;
+            let offset = arg3 as u32;
+            let wh = arg4;
+            let w = (wh >> 32) as u32;
+            let h = (wh & 0xFFFFFFFF) as u32;
+            if w==0 || h==0 { return !0u64; }
+            let stride = w * 4;
+            if crate::wayland::compositor::surface_attach(id, pool, offset, w, h, stride) { 0 } else { !0u64 }
+        }
+        SYS_WL_SURFACE_COMMIT => {
+            let id = arg1 as u32;
+            if crate::wayland::compositor::surface_commit(id) { 0 } else { !0u64 }
+        }
+        SYS_WL_SURFACE_SET_POS => {
+            let id = arg1 as u32;
+            let x = arg2 as i32;
+            let y = arg3 as i32;
+            if crate::wayland::compositor::surface_set_pos(id, x, y) { 0 } else { !0u64 }
+        }
+        SYS_FB_INFO => {
+            // arg1 = *mut FbInfo { width, height, stride, phys, is_bgr, size }
+            let out_ptr = arg1 as *mut u64;
+            if out_ptr.is_null() { return !0u64; }
+            let w = crate::display::width() as u64;
+            let h = crate::display::height() as u64;
+            let s = crate::display::stride() as u64;
+            let phys = crate::display::fb_phys();
+            let is_bgr = if crate::display::is_bgr() {1u64} else {0u64};
+            let size = s * h * 4;
+            unsafe{
+                smap_disable();
+                core::ptr::write_volatile(out_ptr.add(0), w);
+                core::ptr::write_volatile(out_ptr.add(1), h);
+                core::ptr::write_volatile(out_ptr.add(2), s);
+                core::ptr::write_volatile(out_ptr.add(3), phys);
+                core::ptr::write_volatile(out_ptr.add(4), is_bgr);
+                core::ptr::write_volatile(out_ptr.add(5), size);
+                smap_enable();
+            }
+            0
+        }
+        SYS_FB_MAP => {
+            // arg1 = phys, arg2 = virt, arg3 = size
+            let phys = arg1;
+            let virt = arg2;
+            let size = arg3 as usize;
+            if phys==0 || virt==0 || size==0 { return !0u64; }
+            // only allow mapping the framebuffer phys range
+            let fb_phys = crate::display::fb_phys();
+            let fb_size = (crate::display::stride() as usize) * (crate::display::height() as usize) * 4;
+            if phys < fb_phys || phys + size as u64 > fb_phys + fb_size as u64 {
+                // allow also shm pools? For now only FB
+                return !0u64;
+            }
+            let pages = (size + 0xFFF) / 0x1000;
+            let cur = crate::scheduler::CURRENT;
+            let pml4 = crate::scheduler::TASKS[cur].pml4;
+            if pml4.is_null() { return !0u64; }
+            for i in 0..pages {
+                let pa = phys + (i as u64)*0x1000;
+                let va = virt + (i as u64)*0x1000;
+                let flags = crate::vm::PTE_WRITABLE | crate::vm::PTE_USER;
+                if unsafe{ crate::vm::map_page(pml4, pa, va, flags)} !=0 { return !0u64; }
+            }
             0
         }
 

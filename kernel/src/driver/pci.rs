@@ -18,8 +18,18 @@ pub const MAX_MMIO_REGIONS: usize = 64;
 pub static mut MMIO_REGIONS: [MmioRegion; MAX_MMIO_REGIONS] = [MmioRegion { base: 0, size: 0 }; MAX_MMIO_REGIONS];
 pub static mut MMIO_REGION_COUNT: usize = 0;
 
+fn irq_save() -> u64 {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) flags); core::arch::asm!("cli"); }
+    flags
+}
+fn irq_restore(flags: u64) {
+    if flags & (1 << 9) != 0 { unsafe { core::arch::asm!("sti"); } }
+}
+
 fn add_mmio_region(base: u64, size: u64) {
     if size == 0 { return; }
+    let f = irq_save();
     unsafe {
         let idx = MMIO_REGION_COUNT;
         if idx < MAX_MMIO_REGIONS {
@@ -27,18 +37,20 @@ fn add_mmio_region(base: u64, size: u64) {
             MMIO_REGION_COUNT = idx + 1;
         }
     }
+    irq_restore(f);
 }
 
 /// Check if a physical address range falls within a known PCI MMIO region
 pub fn validate_mmio(phys: u64, size: u64) -> bool {
     let end = phys.saturating_add(size);
-    // Use a single unsafe block for static mut access
+    let f = irq_save();
     let safe = unsafe {
         (0..MMIO_REGION_COUNT).any(|i| {
             let r = &MMIO_REGIONS[i];
             phys >= r.base && end <= r.base.saturating_add(r.size)
         })
     };
+    irq_restore(f);
     if !safe {
         uart::write_str("[PCI] MMIO deny phys=");
         let hex = b"0123456789ABCDEF";
@@ -115,13 +127,16 @@ fn class_name(class: u8, subclass: u8) -> &'static str {
         (0x01, 0x08) => "NVMe",
         (0x02, 0x00) => "Ethernet",
         (0x03, 0x00) => "VGA/GPU",
+        (0x03, 0x02) => "3D-GPU",
         (0x04, 0x01) => "Audio",
+        (0x04, 0x03) => "Audio-HD",
         (0x06, 0x00) => "Host Bridge",
         (0x06, 0x04) => "PCI-PCI Bridge",
-        (0x0C, 0x03) => "USB",
+        (0x0C, 0x03) => "USB-XHCI",
         (0x0C, 0x05) => "SMBus",
         (0x08, 0x00) => "PIC",
         (0x08, 0x01) => "PIT",
+        (0x0C, 0x00) => "Serial-FW",
         _ => "Other",
     }
 }
@@ -215,4 +230,42 @@ fn enumerate() {
 fn hex_nib(v: u16) -> u8 {
     let n = (v & 0xF) as u8;
     if n < 10 { b'0' + n } else { b'A' + n - 10 }
+}
+
+fn hw_out_char(c: u8) { uart::putchar(c); crate::console::putchar(c); }
+fn hw_out_str(s: &str) { uart::write_str(s); crate::console::write_str(s); }
+
+/// Scan PCI for shell `hw` command — writes to console+uart
+pub fn scan_for_hw() {
+    for dev in 0..32u16 {
+        for func in 0..8u16 {
+            let vendor = read16(0, dev as u8, func as u8, 0x00);
+            if vendor == 0xFFFF {
+                if func == 0 { break; }
+                continue;
+            }
+            let device = read16(0, dev as u8, func as u8, 0x02);
+            let reg08 = read32(0, dev as u8, func as u8, 0x08);
+            let class = ((reg08 >> 24) & 0xFF) as u8;
+            let subclass = ((reg08 >> 16) & 0xFF) as u8;
+            let htype = ((read32(0, dev as u8, func as u8, 0x0C) >> 16) & 0xFF) as u8;
+
+            hw_out_str("  00:");
+            hw_out_char(hex_nib(dev >> 4));
+            hw_out_char(hex_nib(dev));
+            hw_out_char(b'.');
+            hw_out_char(hex_nib(func));
+            hw_out_char(b' ');
+            hw_out_char(hex_nib(vendor >> 12)); hw_out_char(hex_nib(vendor >> 8));
+            hw_out_char(hex_nib(vendor >> 4)); hw_out_char(hex_nib(vendor));
+            hw_out_char(b':');
+            hw_out_char(hex_nib(device >> 12)); hw_out_char(hex_nib(device >> 8));
+            hw_out_char(hex_nib(device >> 4)); hw_out_char(hex_nib(device));
+            hw_out_char(b' ');
+            hw_out_str(class_name(class, subclass));
+            hw_out_str("\r\n");
+
+            if func == 0 && htype & 0x80 == 0 { break; }
+        }
+    }
 }

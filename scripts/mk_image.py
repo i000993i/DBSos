@@ -111,6 +111,8 @@ def main():
         f.write(b'NVME DISK  '); f.write(bytes([0x08])); f.write(b'\x00'*20)   # volume label (32 bytes)
         dir_entry(f, 'HELLO', 'TXT', 0x20, 3, 13)
         dir_entry(f, 'TEST', '   ', 0x10, 4, 0)
+        dir_entry(f, 'HOME', '   ', 0x10, 9, 0)
+        dir_entry(f, 'ETC', '   ', 0x10, 12, 0)
         f.write(b'\x00')
 
         # HELLO.TXT content at cluster 3
@@ -126,13 +128,82 @@ def main():
         dir_entry(f, 'FORKT  ', 'ELF', 0x20, 8, len(elf))
         f.write(b'\x00')
 
+        # /home cluster 9
+        f.seek(cluster_lba(9)*BPS)
+        dir_entry(f, '.', '   ', 0x10, 9, 0)
+        dir_entry(f, '..', '   ', 0x10, 0, 0)
+        dir_entry(f, 'GUEST', '   ', 0x10, 10, 0)
+        dir_entry(f, 'USER', '   ', 0x10, 11, 0)
+        f.write(b'\x00')
+        # /home/guest cluster 10
+        f.seek(cluster_lba(10)*BPS)
+        dir_entry(f, '.', '   ', 0x10, 10, 0)
+        dir_entry(f, '..', '   ', 0x10, 9, 0)
+        f.write(b'\x00')
+        # /home/user cluster 11
+        f.seek(cluster_lba(11)*BPS)
+        dir_entry(f, '.', '   ', 0x10, 11, 0)
+        dir_entry(f, '..', '   ', 0x10, 9, 0)
+        f.write(b'\x00')
+        # /etc cluster 12
+        f.seek(cluster_lba(12)*BPS)
+        dir_entry(f, '.', '   ', 0x10, 12, 0)
+        dir_entry(f, '..', '   ', 0x10, 0, 0)
+        dir_entry(f, 'PASSWD', '   ', 0x20, 13, 0)
+        f.write(b'\x00')
+        # /etc/passwd empty file cluster 13
+        f.seek(cluster_lba(13)*BPS)
+        f.write(b'\x00'*512)
+
+        # DBS-GR Ring3 ELF (if built) — find free root slot
+        import glob
+        dbs_elf_path = os.path.join(os.path.dirname(__file__), "..", "target", "x86_64-unknown-none", "debug", "dbs-gr-user")
+        if os.path.exists(dbs_elf_path):
+            with open(dbs_elf_path, 'rb') as ef:
+                dbs_data = ef.read()
+            needed = (len(dbs_data) + BPS*SPC -1)//(BPS*SPC)
+            start_cl = 14
+            # find first free slot in root
+            f.seek(root_lba*BPS)
+            root_data = f.read(ROOT_SEC*BPS)
+            free_idx = None
+            for i in range(ROOT_ENT):
+                if root_data[i*32]==0x00 or root_data[i*32]==0xE5:
+                    free_idx=i
+                    break
+            if free_idx is not None:
+                f.seek(root_lba*BPS + free_idx*32)
+                dir_entry(f, 'DBSGR', 'ELF', 0x20, start_cl, len(dbs_data))
+                # ensure terminator after
+                if free_idx+1 < ROOT_ENT:
+                    f.seek(root_lba*BPS + (free_idx+1)*32)
+                    # only write terminator if currently not 0x00? keep
+                    # check if next is not already terminator
+                    f.write(b'\x00')
+                for i in range(needed):
+                    cl = start_cl + i
+                    f.seek(cluster_lba(cl)*BPS)
+                    chunk = dbs_data[i*BPS*SPC:(i+1)*BPS*SPC]
+                    if len(chunk) < BPS*SPC:
+                        chunk = chunk + b'\x00'*(BPS*SPC - len(chunk))
+                    f.write(chunk)
+                for base in (PART_START+RESERVED, PART_START+RESERVED+FAT_SEC):
+                    for i in range(needed):
+                        cl = start_cl + i
+                        nxt = 0xFFFF if i==needed-1 else cl+1
+                        f.seek(base*BPS + cl*2)
+                        f.write(struct.pack('<H', nxt))
+                print(f"DBS-GR user ELF {len(dbs_data)} bytes -> clusters {start_cl}..{start_cl+needed-1} at root idx {free_idx}")
+            else:
+                print("No free root entry for DBSGR.ELF")
+
         # ELF contents at clusters 5..8
         for cl in (5,6,7,8):
             f.seek(cluster_lba(cl)*BPS); f.write(elf)
 
-        # mark clusters 3..8 EOC in FAT1 and FAT2
+        # mark clusters 3..13 EOC in FAT1 and FAT2 (plus dbs-gr if not already)
         for base in (PART_START+RESERVED, PART_START+RESERVED+FAT_SEC):
-            for cl in (3,4,5,6,7,8):
+            for cl in (3,4,5,6,7,8,9,10,11,12,13):
                 f.seek(base*BPS + cl*2); f.write(b'\xFF\xFF')
 
     print(f"OK: {IMG}")

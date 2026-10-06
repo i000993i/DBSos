@@ -129,12 +129,17 @@ unsafe fn grow_heap(min_pages: usize) -> bool {
         for _ in 0..pages {
             let phys = crate::memory::palloc();
             if phys == 0 { break; }
-            // Identity-map the page (heap is in high canonical, use direct map)
-            crate::vm::map_page(
+            // Map the page into the heap virtual region
+            let ret = crate::vm::map_page(
                 crate::vm::KERNEL_PML4 as *mut u64,
                 phys, HEAP_END + allocated,
                 crate::vm::PTE_WRITABLE | crate::vm::PTE_GLOBAL,
             );
+            if ret != 0 {
+                // map_page failed — free the physical page, don't count it
+                crate::memory::pfree(phys);
+                break;
+            }
             allocated += 1;
         }
 
@@ -145,19 +150,17 @@ unsafe fn grow_heap(min_pages: usize) -> bool {
 
         // Initialize all new memory as one large free block
         let offset = grow_start;
-        while offset + block_total(0) as u64 <= new_end {
+        // Один большой свободный блок на всю выросшую область (тело всегда
+        // завершалось break — while здесь был эквивалентен if).
+        if offset + block_total(0) as u64 <= new_end {
             let hdr = offset as *mut BlockHeader;
             let payload_size = (new_end - offset - core::mem::size_of::<BlockHeader>() as u64) as usize;
-            // If this is the first block in the grown region, or if we can fit at least MIN_BLOCK
             if payload_size >= MIN_BLOCK {
                 (*hdr).size = payload_size as u32;
                 (*hdr).used = 0;
                 (*hdr)._pad = 0;
                 let node = header_to_payload(hdr) as *mut FreeNode;
                 free_list_insert(node);
-                break; // One big free block covering the rest
-            } else {
-                break;
             }
         }
 
@@ -210,11 +213,17 @@ pub unsafe fn init(heap_pages: usize) {
     }
 }
 
+#[inline]
+unsafe fn heap_irq_save() -> u64 { let f: u64; core::arch::asm!("pushfq; pop {}", out(reg) f); core::arch::asm!("cli"); f }
+#[inline]
+unsafe fn heap_irq_restore(f: u64) { if f & (1 << 9) != 0 { core::arch::asm!("sti"); } }
+
 /// Allocate `size` bytes from the kernel heap. Returns a pointer or null.
 /// Result is aligned to 16 bytes.
 pub unsafe fn kmalloc(size: usize) -> *mut u8 {
     if size == 0 { return core::ptr::null_mut(); }
     if !HEAP_READY { return core::ptr::null_mut(); }
+    let flags = heap_irq_save();
 
     let total = block_total(size);
 
@@ -242,7 +251,9 @@ pub unsafe fn kmalloc(size: usize) -> *mut u8 {
                 }
 
                 (*hdr).used = 1;
-                return header_to_payload(hdr);
+                let out = header_to_payload(hdr);
+                heap_irq_restore(flags);
+                return out;
             }
             node = (*node).next;
         }
@@ -250,12 +261,17 @@ pub unsafe fn kmalloc(size: usize) -> *mut u8 {
         // No suitable block — grow the heap
         let pages_needed = (total + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
         if !grow_heap(pages_needed) {
+            heap_irq_restore(flags);
             return core::ptr::null_mut(); // OOM
         }
 
-        // Retry allocation after growth
-        kmalloc(size)
+        // Retry allocation after growth — avoid recursion to keep irq flags correct
+        heap_irq_restore(flags);
+        return kmalloc(size);
     }
+    // Unreachable, but restore for safety
+    #[allow(unreachable_code)]
+    { heap_irq_restore(flags); core::ptr::null_mut() }
 }
 
 /// Allocate zeroed memory. Same as kmalloc but memory is zero-filled.
@@ -271,27 +287,50 @@ pub unsafe fn kzalloc(size: usize) -> *mut u8 {
 pub unsafe fn kfree(ptr: *mut u8) {
     if ptr.is_null() { return; }
     if !HEAP_READY { return; }
-
+    let flags = heap_irq_save();
     unsafe {
         let hdr = payload_to_header(ptr);
 
         // Sanity check
-        if (*hdr).used == 0 { return; } // double free — ignore
-        if (hdr as u64) < HEAP_START || (hdr as u64) >= HEAP_END { return; }
+        if (*hdr).used == 0 { heap_irq_restore(flags); return; } // double free — ignore
+        if (hdr as u64) < HEAP_START || (hdr as u64) >= HEAP_END { heap_irq_restore(flags); return; }
 
         (*hdr).used = 0;
         let node = ptr as *mut FreeNode;
         free_list_insert(node);
 
-        // Coalesce with the next block if it's also free
+        // Coalesce with next block if free — preserve alignment
         let next = block_next(hdr);
         if (next as u64) < HEAP_END && (*next).used == 0 {
             let next_node = header_to_payload(next) as *mut FreeNode;
             free_list_remove(next_node);
-            let next_size = core::mem::size_of::<BlockHeader>() + (*next).size as usize;
-            (*hdr).size = ((*hdr).size as usize + next_size) as u32;
+            let cur_total = block_total((*hdr).size as usize);
+            let next_total = block_total((*next).size as usize);
+            let combined = cur_total + next_total;
+            (*hdr).size = (combined - core::mem::size_of::<BlockHeader>()) as u32;
+        }
+        // Coalesce with previous block (scan free list for block ending at hdr)
+        let mut prev_hdr: *mut BlockHeader = core::ptr::null_mut();
+        let mut n = FREE_LIST;
+        while !n.is_null() {
+            let h = payload_to_header(n as *mut u8);
+            if block_next(h) as *mut u8 == hdr as *mut u8 && (*h).used == 0 && h != hdr {
+                prev_hdr = h;
+                break;
+            }
+            n = (*n).next;
+        }
+        if !prev_hdr.is_null() {
+            let prev_node = header_to_payload(prev_hdr) as *mut FreeNode;
+            free_list_remove(node);
+            free_list_remove(prev_node);
+            let prev_total = block_total((*prev_hdr).size as usize);
+            let cur_total = block_total((*hdr).size as usize);
+            (*prev_hdr).size = (prev_total + cur_total - core::mem::size_of::<BlockHeader>()) as u32;
+            free_list_insert(header_to_payload(prev_hdr) as *mut FreeNode);
         }
     }
+    heap_irq_restore(flags);
 }
 
 /// Query heap statistics (free bytes / total bytes).

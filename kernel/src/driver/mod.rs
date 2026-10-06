@@ -11,6 +11,15 @@ pub mod ahci;
 pub mod nvme;
 pub mod ps2;
 pub mod mouse;
+pub mod rtc;
+pub mod adapt;
+pub mod gpu;
+pub mod virtio;
+pub mod rtl8139;
+pub mod wifi;
+pub mod usb;
+pub mod audio;
+pub mod ide;
 
 use traits::*;
 
@@ -19,7 +28,14 @@ static DRIVERS: &[DriverEntry] = &[
     &pci::PciBusDriver,
     &net::E1000Driver,
     &nvme::NvmeDriver,
-    // ahci disabled: hangs in port_init (SATA controller unresponsive on QEMU)
+    &ahci::AhciDriver,
+    &virtio::VirtioProbeDriver,
+    &rtl8139::Rtl8139Driver,
+    &wifi::WifiDriver,
+    &usb::UsbDriver,
+    &audio::AudioDriver,
+    &ide::IdeDriver,
+    &gpu::GpuDriver,
     // ps2 removed: initialized later after IDT/PIC is ready (lib.rs:262)
 ];
 

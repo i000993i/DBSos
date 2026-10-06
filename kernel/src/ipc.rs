@@ -192,11 +192,15 @@ pub fn shmem_test() {
         };
 
         // 3. Verify cap data
-        let cap = cap::get(cap_idx).unwrap();
-        if cap.data == phys && cap.cap_type == CapType::SharedMem as u64 {
-            crate::driver::uart::write_str("[SHMEM] cap OK\r\n");
+        if let Some(cap) = cap::get(cap_idx) {
+            if cap.data == phys && cap.cap_type == CapType::SharedMem as u64 {
+                crate::driver::uart::write_str("[SHMEM] cap OK\r\n");
+            } else {
+                crate::driver::uart::write_str("[SHMEM] cap verify FAIL\r\n");
+                return;
+            }
         } else {
-            crate::driver::uart::write_str("[SHMEM] cap verify FAIL\r\n");
+            crate::driver::uart::write_str("[SHMEM] cap get FAIL\r\n");
             return;
         }
 

@@ -1,9 +1,9 @@
-/// System Console — LEVEL_1_SYSTEM
+/// System Console — LEGACY early-boot only
 ///
-/// Text-mode TTY for system interaction. Switch between graphical desktop
-/// and this console via Ctrl+Alt+F1 (graphical) or Ctrl+Alt+F2 (console).
-///
-/// Provides: text display, scrolling, command prompt, system commands.
+/// Runtime TUI is `crate::shell` (black bg, green `DBSos$>` prompt, full-screen
+/// framebuffer). This module is kept for `display::init` compatibility and
+/// early boot logs (`write_str`/`putchar` are still used before `shell::run`).
+/// After `shell::run()` starts, `ACTIVE` stays false and `render()` is no-op.
 
 use crate::display;
 use crate::driver::uart;
@@ -336,11 +336,11 @@ fn draw_char_in_fb(x: u32, y: u32, ch: u8, color: u32) {
     let g = ((color >> 8) & 0xFF) as u8;
     let b = (color & 0xFF) as u8;
 
-    let idx = (ch as usize) * 8;
-    if idx + 8 > crate::font::FONT_8X16.len() { return; }
-    let glyph = &crate::font::FONT_8X16[idx..idx + 8];
+    let idx = (ch as usize) * 16;
+    if idx + 16 > crate::font::FONT_8X16.len() { return; }
+    let glyph = &crate::font::FONT_8X16[idx..idx + 16];
 
-    for row in 0..8 {
+    for row in 0..16 {
         let bits = glyph[row];
         for col in 0..8 {
             if bits & (0x80 >> col) != 0 {
@@ -490,7 +490,6 @@ fn process_command(cmd: &[u8]) {
         print_str(b"  3  shell         running\r\n");
     } else if cmd == b"desktop" || cmd == b"exit" {
         deactivate();
-        unsafe { crate::gui::NEED_REDRAW = true; }
     } else if cmd == b"reboot" {
         print_str(b"Rebooting...\r\n");
         crate::timer::usleep(1000000);

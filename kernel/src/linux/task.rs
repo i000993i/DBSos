@@ -9,8 +9,62 @@ use crate::memory::{self, PAGE_SIZE};
 
 fn uart_print(s: &str) { crate::driver::uart::write_str(s); }
 
+fn uart_dec(mut v: u64) {
+    if v == 0 { crate::driver::uart::putchar(b'0'); return; }
+    let mut buf = [0u8; 20]; let mut i = 0;
+    while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    while i > 0 { i -= 1; crate::driver::uart::putchar(buf[i]); }
+}
+
+fn uart_hex(mut v: u64) {
+    if v == 0 { crate::driver::uart::putchar(b'0'); return; }
+    let mut buf = [0u8; 16]; let mut i = 0;
+    while v > 0 { let n = (v & 0xF) as u8; buf[i] = if n < 10 { b'0' + n } else { b'A' + n - 10 }; v >>= 4; i += 1; }
+    while i > 0 { i -= 1; crate::driver::uart::putchar(buf[i]); }
+}
+
 pub const MAX_LINUX_FDS: usize = 32;
 pub const MAX_LINUX_TASKS: usize = 16;
+pub const MAX_SIGNALS: usize = 32;
+
+/// Linux signal numbers
+pub const SIG_DFL: u64 = 0;
+pub const SIG_IGN: u64 = 1;
+pub const SIG_ERR: u64 = !0u64;
+
+pub const SIGHUP: usize = 1;
+pub const SIGINT: usize = 2;
+pub const SIGQUIT: usize = 3;
+pub const SIGKILL: usize = 9;
+pub const SIGSEGV: usize = 11;
+pub const SIGTERM: usize = 15;
+
+/// Linux sigaction structure (simplified)
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub handler: u64,    // SA_RESTART etc in flags; handler fn ptr
+    pub flags: u32,
+    pub mask: u64,       // signals to block during handler
+    pub restorer: u64,   // sigreturn trampoline
+}
+
+impl SigAction {
+    pub const fn empty() -> Self {
+        Self { handler: 0, flags: 0, mask: 0, restorer: 0 }
+    }
+}
+
+/// Signal frame pushed on user stack for signal delivery
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SignalFrame {
+    pub rdi: u64, pub rsi: u64, pub rdx: u64, pub rcx: u64,
+    pub r8: u64, pub r9: u64, pub rax: u64, pub rbx: u64,
+    pub rbp: u64, pub r10: u64, pub r11: u64, pub r12: u64,
+    pub r13: u64, pub r14: u64, pub r15: u64,
+    pub rflags: u64, pub rip: u64, pub rsp: u64,
+    pub signal_num: u64, pub siginfo_pad: [u8; 128],
+}
 
 #[derive(Clone, Copy)]
 pub struct LinuxFd {
@@ -49,6 +103,14 @@ pub struct LinuxTask {
     pub exit_status: i32,
     pub uid: u32,
     pub gid: u32,
+    // Signal handling
+    pub signal_handlers: [SigAction; MAX_SIGNALS],  // per-signal handlers
+    pub signal_pending: u32,                          // bitmask of pending signals
+    pub signal_mask: u64,                             // blocked signals mask
+    pub signal_frame: SignalFrame,                    // saved context during handler
+    pub in_signal_handler: bool,                      // currently inside signal handler
+    pub saved_rsp: u64,                               // user RSP before signal frame push
+    pub saved_rip: u64,                               // user RIP before signal frame
 }
 
 impl LinuxTask {
@@ -65,6 +127,22 @@ impl LinuxTask {
             mm: LinuxMM::empty(),
             alive: false, exit_status: 0,
             uid: 0, gid: 0,
+            signal_handlers: {
+                const INIT: SigAction = SigAction::empty();
+                [INIT; MAX_SIGNALS]
+            },
+            signal_pending: 0,
+            signal_mask: 0,
+            signal_frame: SignalFrame {
+                rdi: 0, rsi: 0, rdx: 0, rcx: 0,
+                r8: 0, r9: 0, rax: 0, rbx: 0,
+                rbp: 0, r10: 0, r11: 0, r12: 0,
+                r13: 0, r14: 0, r15: 0,
+                rflags: 0, rip: 0, rsp: 0,
+                signal_num: 0, siginfo_pad: [0; 128],
+            },
+            in_signal_handler: false,
+            saved_rsp: 0, saved_rip: 0,
         }
     }
 
@@ -358,10 +436,165 @@ impl LinuxTask {
     // ── Process operations ────────────────────────────────────────
 
     pub fn sys_fork(&mut self) -> i64 {
-        // Simplified fork: create a new Linux task with cloned address space
-        // For now, return error (proper fork requires deep clone)
-        uart_print("[LINUX] fork() called — returning -ENOSYS\r\n");
-        -(LINUX_ENOSYS as i64)
+        // Find free Linux task slot
+        let child_slot = unsafe {
+            let mut found = None;
+            for i in 0..MAX_LINUX_TASKS {
+                if !LINUX_TASKS[i].alive {
+                    found = Some(i);
+                    break;
+                }
+            }
+            match found {
+                Some(s) => s,
+                None => return -(LINUX_ENOMEM as i64),
+            }
+        };
+
+        // Clone address space: copy PML4 entries (sharing page table pages — CoW simplified)
+        let new_pml4_phys = memory::palloc();
+        if new_pml4_phys == 0 { return -(LINUX_ENOMEM as i64); }
+
+        unsafe {
+            // Copy parent's PML4
+            core::ptr::copy_nonoverlapping(
+                self.pml4_phys as *const u8,
+                new_pml4_phys as *mut u8,
+                4096,
+            );
+
+            // Create child task
+            let child = &mut *LINUX_TASKS.as_mut_ptr().add(child_slot);
+            child.alive = true;
+            child.pid = crate::scheduler::next_task_id();
+            child.ppid = self.pid;
+            child.pml4_phys = new_pml4_phys;
+            child.entry = self.entry;
+            child.brk = self.brk;
+            child.mmap_base = self.mmap_base;
+            child.stack_top = self.stack_top;
+            child.stack_size = self.stack_size;
+            child.uid = self.uid;
+            child.gid = self.gid;
+
+            // Copy file descriptors
+            for i in 0..MAX_LINUX_FDS {
+                child.fds[i] = self.fds[i];
+            }
+
+            // Copy CWD
+            child.cwd = self.cwd;
+            child.cwd_len = self.cwd_len;
+
+            // Copy signal handlers
+            for i in 0..MAX_SIGNALS {
+                child.signal_handlers[i] = self.signal_handlers[i];
+            }
+            child.signal_mask = self.signal_mask;
+            child.signal_pending = 0;
+
+            // Create scheduler task for child
+            let parent_dbsos_task = self.dbsos_task;
+            let child_dbsos_task = crate::scheduler::fork(parent_dbsos_task);
+            if child_dbsos_task == 0 {
+                child.alive = false;
+                memory::pfree(new_pml4_phys);
+                return -(LINUX_ENOMEM as i64);
+            }
+            child.dbsos_task = child_dbsos_task;
+
+            uart_print("[LINUX] fork: parent pid=");
+            uart_dec(self.pid);
+            uart_print(" child pid=");
+            uart_dec(child.pid);
+            uart_print("\r\n");
+
+            child.pid as i64
+        }
+    }
+
+    /// execve: загрузить ELF через VFS и заменить образ текущего процесса.
+    /// Возвращает 0 при успехе (RIP переключается планировщиком на self.entry),
+    /// -ENOENT/-ENOMEM/-ENOEXEC при ошибке. Старый pml4 намеренно не освобождаем
+    /// чтобы не уронить running CR3 — утечка одной таблицы до exit (безопасно).
+    pub fn sys_execve(&mut self, path_ptr: *const u8) -> i64 {
+        // 1. Прочитать C-string путь из user-памяти (до 128 байт)
+        let mut path = [0u8; 128];
+        let mut plen = 0usize;
+        unsafe {
+            for i in 0..128 {
+                let c = core::ptr::read_volatile(path_ptr.add(i));
+                path[i] = c;
+                if c == 0 { break; }
+                plen += 1;
+            }
+        }
+        if plen == 0 { return -(LINUX_ENOENT as i64); }
+        let upath = &path[..plen];
+
+        // 2. Открыть через VFS и узнать размер
+        let fd = crate::vfs::open(upath, 0);
+        if fd < 0 { return -(LINUX_ENOENT as i64); }
+        let mut st = crate::vfs::StatInfo { size: 0, is_dir: false, cluster: 0 };
+        if crate::vfs::stat(upath, &mut st) != 0 { crate::vfs::close(fd); return -(LINUX_ENOENT as i64); }
+        if st.is_dir { crate::vfs::close(fd); return -(LINUX_ENOEXEC as i64); }
+        let fsize = st.size as usize;
+        if fsize < 64 || fsize > 256 * 1024 { crate::vfs::close(fd); return -(LINUX_ENOEXEC as i64); }
+
+        // 3. Прочитать файл в heap-буфер (FAT/tmpfs отдают всё за один read)
+        let buf = unsafe { crate::heap::kmalloc(fsize) };
+        if buf.is_null() { crate::vfs::close(fd); return -(LINUX_ENOMEM as i64); }
+        let slice = unsafe { core::slice::from_raw_parts_mut(buf, fsize) };
+        let n = crate::vfs::read(fd, slice);
+        crate::vfs::close(fd);
+        if n <= 0 || (n as usize) < 64 { unsafe { crate::heap::kfree(buf); } return -(LINUX_ENOEXEC as i64); }
+        let read_total = n as usize;
+        let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, read_total) };
+
+        // 4. Быстрая проверка ELF magic до тяжёлой загрузки
+        if elf_data.len() < 4 || elf_data[0..4] != [0x7F, b'E', b'L', b'F'] {
+            unsafe { crate::heap::kfree(buf); }
+            return -(LINUX_ENOEXEC as i64);
+        }
+
+        // 5. Загрузить в новое адресное пространство
+        let prog = match super::elf::load_linux_elf(elf_data) {
+            Ok(p) => p,
+            Err(_) => { unsafe { crate::heap::kfree(buf); } return -(LINUX_ENOEXEC as i64); }
+        };
+        unsafe { crate::heap::kfree(buf); }
+
+        // 6. Заменить образ: entry/brk/mmap/stack/pml4. Сигналы сбросить, fds оставить (POSIX).
+        // Старый pml4 намеренно leaked (не трогаем running CR3).
+        let old_pml4 = self.pml4_phys;
+        self.entry = prog.entry;
+        self.pml4_phys = prog.pml4 as u64;
+        self.brk = prog.brk;
+        self.mmap_base = prog.mmap_base;
+        self.stack_top = prog.stack_top;
+        self.stack_size = prog.stack_size;
+        for i in 0..MAX_SIGNALS { self.signal_handlers[i] = SigAction::empty(); }
+        self.signal_pending = 0;
+        self.signal_mask = 0;
+        self.in_signal_handler = false;
+        // 7. Синхронизация с планировщиком: следующий context switch должен
+        // загрузить НОВЫЙ pml4, иначе задача продолжит жить в старом адресном пространстве.
+        unsafe {
+            if let Some(slot) = crate::scheduler::find_task(self.dbsos_task) {
+                crate::scheduler::TASKS[slot].pml4 = prog.pml4;
+                crate::scheduler::TASKS[slot].pml4_phys = prog.pml4 as u64;
+            }
+        }
+        // 8. RIP-редирект: syscall_stub вернётся не в вызывающий код, а в entry
+        // нового образа (с его стеком и CR3). Регистры обнулены стабом.
+        unsafe {
+            crate::syscall::request_exec_redirect(prog.entry, prog.stack_top, prog.pml4 as u64);
+        }
+        let _ = old_pml4;
+        uart_print("[LINUX] execve ok entry=0x");
+        uart_hex(prog.entry);
+        uart_print(" (redirect armed)\r\n");
+        0
     }
 
     pub fn sys_exit(&mut self, status: i32) -> i64 {
@@ -526,9 +759,9 @@ impl LinuxTask {
     }
 
     pub fn sys_clock_gettime(&self, _clock_id: u32, tp_ptr: *mut u8) -> i64 {
-        let ms = crate::timer::millis();
-        let secs = (ms / 1000) as i64;
-        let nsecs = ((ms % 1000) * 1_000_000) as i64;
+        let ns = crate::timer::nanos();
+        let secs = (ns / 1_000_000_000) as i64;
+        let nsecs = (ns % 1_000_000_000) as i64;
         unsafe {
             let tp = tp_ptr as *mut i64;
             *tp = secs;
@@ -604,6 +837,161 @@ impl LinuxTask {
         count as i64
     }
 
+    // ── Signal operations ──────────────────────────────────────────
+
+    /// Register a signal handler: rt_sigaction(signum, act, oldact, sigsetsize)
+    pub fn sys_rt_sigaction(&mut self, signum: usize, act_ptr: *const u8, old_ptr: *mut u8, _sigsetsize: usize) -> i64 {
+        if signum >= MAX_SIGNALS || signum == 0 { return -(LINUX_EINVAL as i64); }
+
+        // Return old handler if requested
+        if !old_ptr.is_null() {
+            unsafe {
+                let old = old_ptr as *mut SigAction;
+                *old = self.signal_handlers[signum];
+            }
+        }
+
+        // Set new handler
+        if !act_ptr.is_null() {
+            unsafe {
+                let act = &*(act_ptr as *const SigAction);
+                self.signal_handlers[signum] = *act;
+                uart_print("[SIGNAL] sigaction(");
+                uart_dec(signum as u64);
+                uart_print(") handler=0x");
+                uart_hex(act.handler);
+                uart_print("\r\n");
+            }
+        }
+
+        0
+    }
+
+    /// Modify signal mask: rt_sigprocmask(how, set, oldset, sigsetsize)
+    pub fn sys_rt_sigprocmask(&mut self, how: i32, set_ptr: *const u64, old_ptr: *mut u64, _sigsetsize: usize) -> i64 {
+        // Return old mask if requested
+        if !old_ptr.is_null() {
+            unsafe { *old_ptr = self.signal_mask; }
+        }
+
+        if !set_ptr.is_null() {
+            unsafe {
+                let new_mask = *set_ptr;
+                match how {
+                    0 => self.signal_mask |= new_mask,   // SIG_BLOCK
+                    1 => self.signal_mask &= !new_mask,  // SIG_UNBLOCK
+                    2 => self.signal_mask = new_mask,     // SIG_SETMASK
+                    _ => {}
+                }
+            }
+        }
+        0
+    }
+
+    /// Send signal to process: kill(pid, sig)
+    pub fn sys_kill(&mut self, target_pid: i32, sig: i32) -> i64 {
+        if sig < 0 || sig >= MAX_SIGNALS as i32 { return -(LINUX_EINVAL as i64); }
+        let sig_bit = 1u32 << (sig as u32);
+
+        if target_pid == 0 {
+            // Signal to all processes in current group
+            for i in 0..MAX_LINUX_TASKS {
+                unsafe {
+                    if LINUX_TASKS[i].alive {
+                        LINUX_TASKS[i].signal_pending |= sig_bit;
+                    }
+                }
+            }
+        } else if target_pid == -1 {
+            // Signal to all processes
+            for i in 0..MAX_LINUX_TASKS {
+                unsafe {
+                    if LINUX_TASKS[i].alive {
+                        LINUX_TASKS[i].signal_pending |= sig_bit;
+                    }
+                }
+            }
+        } else if target_pid > 0 {
+            // Signal to specific PID
+            let mut found = false;
+            unsafe {
+                for i in 0..MAX_LINUX_TASKS {
+                    if LINUX_TASKS[i].alive && LINUX_TASKS[i].pid == target_pid as u64 {
+                        LINUX_TASKS[i].signal_pending |= sig_bit;
+                        found = true;
+                    }
+                }
+            }
+            if !found { return -(LINUX_ESRCH as i64); }
+        }
+
+        // SIGKILL and SIGTERM always terminate
+        if sig == SIGKILL as i32 || sig == SIGTERM as i32 {
+            self.sys_exit(sig);
+        }
+
+        0
+    }
+
+    /// Send signal to thread: tgkill(tgid, tid, sig)
+    pub fn sys_tgkill(&mut self, _tgid: i32, tid: i32, sig: i32) -> i64 {
+        if sig < 0 || sig >= MAX_SIGNALS as i32 { return -(LINUX_EINVAL as i64); }
+        let sig_bit = 1u32 << (sig as u32);
+
+        unsafe {
+            for i in 0..MAX_LINUX_TASKS {
+                if LINUX_TASKS[i].alive && LINUX_TASKS[i].pid == tid as u64 {
+                    LINUX_TASKS[i].signal_pending |= sig_bit;
+                    if sig == SIGKILL as i32 || sig == SIGTERM as i32 {
+                        LINUX_TASKS[i].alive = false;
+                    }
+                    return 0;
+                }
+            }
+        }
+        -(LINUX_ESRCH as i64)
+    }
+
+    /// Check and deliver pending signals (called from syscall entry/return).
+    /// Returns Some(handler_rip) if a signal handler should be called, None otherwise.
+    pub fn check_signals(&mut self) -> Option<u64> {
+        if self.signal_pending == 0 { return None; }
+
+        for sig in 1..MAX_SIGNALS {
+            let sig_bit = 1u32 << sig;
+            if self.signal_pending & sig_bit == 0 { continue; }
+            if self.signal_mask & (1u64 << sig) != 0 { continue; } // blocked
+
+            // Clear pending
+            self.signal_pending &= !sig_bit;
+
+            let handler = self.signal_handlers[sig].handler;
+            match handler {
+                SIG_DFL => {
+                    // Default action: terminate for fatal signals
+                    match sig {
+                        SIGHUP | SIGINT | SIGQUIT | SIGTERM | SIGSEGV => {
+                            self.sys_exit(128 + sig as i32);
+                            return None;
+                        }
+                        _ => {} // ignore others
+                    }
+                }
+                SIG_IGN => {}
+                _ => {
+                    // Custom handler — deliver signal
+                    uart_print("[SIGNAL] delivering sig=");
+                    uart_dec(sig as u64);
+                    uart_print(" to pid=");
+                    uart_dec(self.pid);
+                    uart_print("\r\n");
+                    return Some(handler);
+                }
+            }
+        }
+        None
+    }
+
     // ── Helpers ───────────────────────────────────────────────────
 
     fn alloc_fd(&mut self) -> Option<usize> {
@@ -657,6 +1045,15 @@ pub fn create_task() -> Option<&'static mut LinuxTask> {
             }
         }
         None
+    }
+}
+
+/// Итератор для `top`: (pid, entry, alive) по всем слотам.
+pub fn for_each_task<F: FnMut(usize, u64, u64, bool)>(mut f: F) {
+    unsafe {
+        for i in 0..MAX_LINUX_TASKS {
+            f(i, LINUX_TASKS[i].pid, LINUX_TASKS[i].entry, LINUX_TASKS[i].alive);
+        }
     }
 }
 

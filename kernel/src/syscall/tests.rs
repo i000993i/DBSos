@@ -50,9 +50,10 @@ pub unsafe fn write_user_code_e1000(dst: *mut u8) {
     dst.add(p).write(0x21); p += 1;
     dst.add(p).write(0xCB); p += 1;
 
-    p += emit_mov_imm64(dst, p, 8, 0x20000);
-    p += emit_mov_imm64(dst, p, 9, MMIO_VIRT);
-    p += emit_mov_r64(dst, p, 2, 3);
+    // ABI: rax=num, arg1=rdi, arg2=rsi, arg3=rdx (r8/r9 — слоты старого ABI)
+    p += emit_mov_imm64(dst, p, 6, 0x20000);      // arg2 = len
+    p += emit_mov_imm64(dst, p, 2, MMIO_VIRT);    // arg3 = virt
+    p += emit_mov_r64(dst, p, 7, 3);              // arg1 = bar phys (rbx)
     p += emit_mov_imm32(dst, p, 0, 17);
     p += emit_syscall(dst, p);
 
@@ -149,17 +150,17 @@ pub unsafe fn test_ring3_console() {
     for i in 0..4 { code.add(off+i).write((80u32 >> (i*8)) as u8); }
     off += 4;
     let cap_off = off;
-    off += emit_mov_imm64(code, off, 2, 0);
-    off += emit_mov_r64(code, off, 8, 4);
-    off += emit_mov_imm64(code, off, 9, 0);
+    off += emit_mov_imm64(code, off, 7, 0);        // arg1 = cap_idx (rdi, патчится ниже)
+    off += emit_mov_r64(code, off, 6, 4);          // arg2 = rsp (буфер, rsi)
+    off += emit_mov_imm64(code, off, 2, 0);        // arg3 = 0 (rdx)
     off += emit_mov_imm32(code, off, 0, 12);
     off += emit_syscall(code, off);
-    off += emit_mov_r64(code, off, 2, 4);
+    off += emit_mov_r64(code, off, 7, 4);          // rdi = rsp (буфер)
     code.add(off).write(0x48); off += 1;
     code.add(off).write(0x83); off += 1;
-    code.add(off).write(0xC2); off += 1;
+    code.add(off).write(0xC7); off += 1;           // add rdi, 12
     code.add(off).write(12); off += 1;
-    off += emit_mov_imm32(code, off, 8, 64);
+    off += emit_mov_imm32(code, off, 6, 64);       // arg2 = len (rsi)
     off += emit_mov_imm32(code, off, 0, 20);
     off += emit_syscall(code, off);
     code.add(off).write(0x48); off += 1;

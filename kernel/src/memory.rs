@@ -161,7 +161,7 @@ pub fn pfree(phys: u64) {
             return;
         }
         bit_set(a.bitmap_addr, page, 0);
-        a.free_pages -= 1;
+        a.free_pages += 1;
         if page < a.first_page {
             a.first_page = page;
         }
@@ -177,6 +177,17 @@ pub fn pfree_n(phys: u64, n: usize) {
 
 pub fn free_count() -> usize {
     unsafe { (*&raw const ALLOC).free_pages }
+}
+
+/// Давление памяти 0..100 (% занято). OOM-порог для политик: ≥95 — отказ
+/// в некритичных аллокациях (пока только диагностика в `mem` + RS-Kernel-Test).
+pub fn pressure() -> u8 {
+    unsafe {
+        let a = &*(&raw const ALLOC as *const PhysAllocator);
+        if a.total_pages == 0 { return 100; }
+        let used = a.total_pages.saturating_sub(a.free_pages);
+        ((used as u64 * 100) / a.total_pages as u64).min(100) as u8
+    }
 }
 
 pub fn total_pages() -> usize {

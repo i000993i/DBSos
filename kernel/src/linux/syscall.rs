@@ -9,6 +9,13 @@ use super::{*, task::LinuxTask};
 /// Returns: positive value = success (returned to user), 0 = handled internally,
 /// negative = error (will be converted to Linux errno)
 pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    // Check for pending signals before handling syscall
+    if let Some(handler) = task.check_signals() {
+        // Signal handler needs to be called — return special value
+        // The interrupt/syscall return path will push signal frame and jump to handler
+        return -(handler as i64);
+    }
+
     match nr {
         // ── I/O ───────────────────────────────────────────────────
         LINUX_SYS_READ => {
@@ -83,6 +90,10 @@ pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, 
         LINUX_SYS_GETPID => {
             task.pid as i64
         }
+        LINUX_SYS_GETTID => {
+            // Однопоточно: tid == pid (настоящие CLONE_THREAD — следующий этап)
+            task.pid as i64
+        }
         LINUX_SYS_GETPPID => {
             task.ppid as i64
         }
@@ -109,12 +120,20 @@ pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, 
             task.sys_fork()
         }
         LINUX_SYS_CLONE => {
-            // Simplified clone — treat as fork for now
+            // fork-семантика; честно предупреждаем про requested VM-sharing
+            if a1 & (super::LINUX_CLONE_VM | super::LINUX_CLONE_THREAD) != 0 {
+                static mut WARNED: bool = false;
+                unsafe {
+                    if !WARNED {
+                        WARNED = true;
+                        crate::driver::uart::write_str("[LINUX] clone: VM/thread sharing -> fork copy (TODO)\r\n");
+                    }
+                }
+            }
             task.sys_fork()
         }
         LINUX_SYS_EXECVE => {
-            // Not implemented yet — return error
-            -(LINUX_ENOSYS as i64)
+            task.sys_execve(a1 as *const u8)
         }
         LINUX_SYS_EXIT => {
             task.sys_exit(a1 as i32)
@@ -123,10 +142,10 @@ pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, 
             task.sys_wait4(a1 as i32, a2 as *mut i32, a3 as i32)
         }
         LINUX_SYS_KILL => {
-            0 // No-op for now
+            task.sys_kill(a1 as i32, a2 as i32)
         }
         LINUX_SYS_TGKILL => {
-            0 // No-op
+            task.sys_tgkill(a1 as i32, a2 as i32, a3 as i32)
         }
         LINUX_SYS_SCHED_YIELD => {
             crate::scheduler::context::yield_now();
@@ -177,11 +196,11 @@ pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, 
         }
         LINUX_SYS_CLOCK_GETRES => {
             if a2 != 0 {
-                // resolution = 1ms
+                // resolution = 100ns (HPET 10MHz)
                 unsafe {
                     let tv = a2 as *mut u64;
                     *tv = 0;           // tv_sec
-                    *tv.add(1) = 1000000; // tv_nsec (1ms)
+                    *tv.add(1) = 100;  // tv_nsec (100ns)
                 }
             }
             0
@@ -192,16 +211,18 @@ pub fn handle_syscall(task: &mut LinuxTask, nr: u64, a1: u64, a2: u64, a3: u64, 
 
         // ── Signals ──────────────────────────────────────────────
         LINUX_SYS_RT_SIGACTION => {
-            0 // Ignore signal registration
+            task.sys_rt_sigaction(a1 as usize, a2 as *const u8, a3 as *mut u8, a4 as usize)
         }
         LINUX_SYS_RT_SIGPROCMASK => {
-            0 // Ignore signal mask changes
+            task.sys_rt_sigprocmask(a1 as i32, a2 as *const u64, a3 as *mut u64, a4 as usize)
         }
         LINUX_SYS_SIGALTSTACK => {
-            0 // Ignore
+            0 // Ignore for now
         }
         LINUX_SYS_RT_SIGRETURN => {
-            0 // Should not be called normally
+            // Signal handler returned — restore context
+            // In real implementation this restores registers from signal frame
+            0
         }
 
         // ── System info ──────────────────────────────────────────

@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceType {
     Legacy,
+    Gpu,
     Pci { vendor: u16, device: u16, class: u8, subclass: u8 },
 }
 

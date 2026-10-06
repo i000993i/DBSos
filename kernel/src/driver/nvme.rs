@@ -70,9 +70,15 @@ fn cq_db(qid: u32) -> u64 { 0x1000 + ((2 * qid + 1) as u64) * (1u64 << (2 + unsa
 fn spin_until(mut f: impl FnMut() -> bool, max_us: u64) -> bool {
     use crate::timer;
     let start = timer::ticks();
+    let mut iter: u64 = 0;
+    const ITER_CAP: u64 = 20_000_000;
     while !f() {
-        if timer::ticks().wrapping_sub(start) > max_us * 10 {
-            return false;
+        iter += 1;
+        if iter >= ITER_CAP { return false; }
+        if (iter & 1023) == 0 && max_us > 0 {
+            if timer::ticks().wrapping_sub(start) > max_us * 10 {
+                return false;
+            }
         }
         core::hint::spin_loop();
     }
@@ -331,6 +337,57 @@ fn nvme_rw(opcode: u8, lba: u64, count: u16, buf: *mut u8) -> bool {
 
 fn is_fat_type(pt: u8) -> bool { matches!(pt, 0x01|0x04|0x06|0x07|0x0B|0x0C|0x0E|0x1B|0x1C) }
 
+/// GPT: прочитать header (LBA1) + entries, вернуть StartingLBA первой usable партиции.
+/// Bounded: не более 32 секторов entries, без зависаний.
+fn gpt_first_lba() -> Option<u64> {
+    let hdr_phys = crate::memory::palloc();
+    if hdr_phys == 0 { return None; }
+    unsafe { core::ptr::write_bytes(hdr_phys as *mut u8, 0, 4096); }
+    if !read_sectors(1, 1, hdr_phys as *mut u8) { crate::memory::pfree(hdr_phys); return None; }
+    let hdr = unsafe { &*(hdr_phys as *const [u8; 512]) };
+    let parsed = crate::gpt::parse_header(hdr);
+    crate::memory::pfree(hdr_phys);
+    let (entry_lba, entry_num, entry_size) = parsed?;
+    // entries: entry_num * entry_size bytes, читаем не более 32 секторов (16KB)
+    let total_bytes = (entry_num as u64) * (entry_size as u64);
+    let sectors = ((total_bytes + 511) / 512).min(32) as u16;
+    if sectors == 0 { return None; }
+    // Временный буфер: palloc постранично, максимум 32 сектора = 4 страницы
+    let pages = ((sectors as usize * 512 + 4095) / 4096).min(4);
+    let mut bufs = [0u64; 4];
+    for i in 0..pages {
+        let p = crate::memory::palloc();
+        if p == 0 { for j in 0..i { crate::memory::pfree(bufs[j]); } return None; }
+        bufs[i] = p;
+        unsafe { core::ptr::write_bytes(p as *mut u8, 0, 4096); }
+    }
+    // Читаем сектора entries последовательно в страницы
+    let mut ok = true;
+    for s in 0..sectors {
+        let page_idx = (s as usize * 512) / 4096;
+        let off = (s as usize * 512) % 4096;
+        let bounce = bufs[page_idx] + off as u64;
+        // Используем прямой вызов: читаем во временный palloc
+        let t = crate::memory::palloc();
+        if t == 0 { ok = false; break; }
+        if !read_sectors(entry_lba + s as u64, 1, t as *mut u8) { crate::memory::pfree(t); ok = false; break; }
+        unsafe { core::ptr::copy_nonoverlapping(t as *const u8, bounce as *mut u8, 512); }
+        crate::memory::pfree(t);
+    }
+    let mut result = None;
+    if ok {
+        // Собираем entries в непрерывный слайс для парсера: копируем из страниц
+        // Упрощение: ищем прямо по страницам, entry_size обычно 128.
+        let mut flat = [0u8; 4096];
+        let copy_len = (sectors as usize * 512).min(4096);
+        unsafe { core::ptr::copy_nonoverlapping(bufs[0] as *const u8, flat.as_mut_ptr(), copy_len); }
+        // Если entries больше 4096 — хватит первых (первая партиция обычно в начале)
+        result = crate::gpt::first_partition_lba(&flat[..copy_len], entry_num, entry_size);
+    }
+    for i in 0..pages { crate::memory::pfree(bufs[i]); }
+    result
+}
+
 fn parse_fat_bpb(phys: u64) {
     let bpb = unsafe { &*(phys as *const [u8; 512]) };
     let bps = (bpb[0x0B] as u16) | ((bpb[0x0C] as u16) << 8);
@@ -376,11 +433,19 @@ fn init_fs() {
         return;
     }
 
-    let mbr = unsafe { core::slice::from_raw_parts(mbr_phys as *const u8, 512) };
-    let sig = (mbr[0x1FE] as u16) | ((mbr[0x1FF] as u16) << 8);
+    let (sig, b0, ptype, pstart, protective) = {
+        let mbr = unsafe { core::slice::from_raw_parts(mbr_phys as *const u8, 512) };
+        let sig = (mbr[0x1FE] as u16) | ((mbr[0x1FF] as u16) << 8);
+        let b0 = mbr[0];
+        let ptype = mbr[0x1C2];
+        let pstart = (mbr[0x1C6] as u32) | ((mbr[0x1C7] as u32) << 8) |
+                     ((mbr[0x1C8] as u32) << 16) | ((mbr[0x1C9] as u32) << 24);
+        let prot = ptype == 0xEE || crate::gpt::is_protective_mbr(mbr);
+        (sig, b0, ptype, pstart, prot)
+    };
 
     if sig != 0xAA55 {
-        if mbr[0] == 0xEB || mbr[0] == 0xE9 {
+        if b0 == 0xEB || b0 == 0xE9 {
             unsafe { PART_LBA = 0; }
             parse_fat_bpb(mbr_phys);
         }
@@ -389,11 +454,26 @@ fn init_fs() {
         return;
     }
 
-    let ptype = mbr[0x1C2];
-    let pstart = (mbr[0x1C6] as u32) | ((mbr[0x1C7] as u32) << 8) |
-                 ((mbr[0x1C8] as u32) << 16) | ((mbr[0x1C9] as u32) << 24);
+    // GPT protective MBR (0xEE): ESP образ — GPT+FAT. Ищем первую партицию через GPT.
+    if protective {
+        if let Some(gpt_lba) = gpt_first_lba() {
+            unsafe { PART_LBA = gpt_lba; }
+            crate::memory::pfree(mbr_phys);
+            let vbr_phys = crate::memory::palloc();
+            if vbr_phys == 0 { return; }
+            unsafe { core::ptr::write_bytes(vbr_phys as *mut u8, 0, 4096); }
+            if !read_sectors(gpt_lba, 1, vbr_phys as *mut u8) { crate::memory::pfree(vbr_phys); return; }
+            parse_fat_bpb(vbr_phys);
+            crate::memory::pfree(vbr_phys);
+            unsafe { FS_INIT = true; }
+            uart::write_str("[NVMe] GPT part LBA="); uart_dec(gpt_lba); uart::write_str("\r\n");
+            return;
+        }
+        crate::memory::pfree(mbr_phys);
+        return;
+    }
 
-    if ptype == 0 || ptype == 0xEE || !is_fat_type(ptype) {
+    if ptype == 0 || !is_fat_type(ptype) {
         crate::memory::pfree(mbr_phys);
         return;
     }
@@ -546,6 +626,10 @@ pub fn read_fat_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
     let part_lba = unsafe { PART_LBA };
     read_sectors(part_lba + lba, 1, buf.as_mut_ptr())
 }
+
+pub fn part_lba() -> u64 { unsafe { PART_LBA } }
+
+pub fn is_ready() -> bool { unsafe { INIT } }
 
 pub fn write_fat_sector(lba: u64, buf: &[u8; 512]) -> bool {
     if !unsafe { FS_INIT } { return false; }

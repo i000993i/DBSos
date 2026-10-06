@@ -30,6 +30,50 @@ pub const LINUX_STACK_TOP: u64 = 0x0000_7FFF_FFF0;   // Stack grows down
 pub const LINUX_BRK_START: u64 = 0x0000_0060_0000;   // Initial brk
 pub const LINUX_VSYSCALL: u64 = 0xFFFF_FFFF_FF60_0000; // vsyscall page (compat)
 
+/// ASLR entropy: 28 bits → 256 MB randomization range for mmap/stack
+const ASLR_BITS: u32 = 28;
+const ASLR_MASK: u64 = (1 << ASLR_BITS) - 1;
+
+/// Simple xorshift64 PRNG — seeded from HPET timer + CSPRNG-like entropy
+static mut ASLR_SEED: u64 = 0;
+
+pub fn aslr_init() {
+    let t = crate::timer::ticks();
+    let t2 = crate::timer::millis();
+    let rdtsc: u64;
+    unsafe {
+        let low: u32;
+        let high: u32;
+        core::arch::asm!("rdtsc", out("eax") low, out("edx") high);
+        rdtsc = (high as u64) << 32 | low as u64;
+    }
+    unsafe {
+        ASLR_SEED = t ^ (t2 << 17) ^ rdtsc ^ 0xDEAD_BEEF_CAFE_BABE;
+        if ASLR_SEED == 0 { ASLR_SEED = 1; }
+    }
+}
+
+fn aslr_next() -> u64 {
+    unsafe {
+        // xorshift64
+        ASLR_SEED ^= ASLR_SEED << 13;
+        ASLR_SEED ^= ASLR_SEED >> 7;
+        ASLR_SEED ^= ASLR_SEED << 17;
+        ASLR_SEED & ASLR_MASK
+    }
+}
+
+/// Randomize mmap base for a new process (ASLR)
+pub fn randomize_mmap_base() -> u64 {
+    LINUX_MMAP_BASE + (aslr_next() << 12)  // page-aligned, up to 256MB above default
+}
+
+/// Randomize stack top for a new process (ASLR)
+pub fn randomize_stack_top() -> u64 {
+    // Stack: 0x7FFF_FFF0 minus random offset (up to 256MB)
+    LINUX_STACK_TOP - (aslr_next() << 12)
+}
+
 /// Linux x86_64 syscall numbers (most important ones)
 pub const LINUX_SYS_READ: u64 = 0;
 pub const LINUX_SYS_WRITE: u64 = 1;
@@ -91,6 +135,11 @@ pub const LINUX_SYS_GETGID: u64 = 104;
 pub const LINUX_SYS_GETEUID: u64 = 107;
 pub const LINUX_SYS_GETEGID: u64 = 108;
 pub const LINUX_SYS_GETPPID: u64 = 110;
+pub const LINUX_SYS_GETTID: u64 = 186;
+
+// clone(2) флаги: пока поддерживается fork-семантика (копия), VM-sharing — TODO.
+pub const LINUX_CLONE_VM: u64 = 0x100;
+pub const LINUX_CLONE_THREAD: u64 = 0x10000;
 pub const LINUX_SYS_SETPGID: u64 = 109;
 pub const LINUX_SYS_GETPGID: u64 = 121;
 pub const LINUX_SYS_GETSID: u64 = 124;
@@ -153,6 +202,8 @@ pub const LINUX_EMFILE: u64 = 24;
 pub const LINUX_ENOSYS: u64 = 38;
 pub const LINUX_ENOBUFS: u64 = 105;
 pub const LINUX_ECHILD: u64 = 10;
+pub const LINUX_ESRCH: u64 = 3;
+pub const LINUX_ENOEXEC: u64 = 8;
 
 /// Map a DBSos VFS error to a Linux errno
 pub fn to_linux_errno(dbsos_err: i32) -> u64 {
@@ -164,4 +215,90 @@ pub fn to_linux_errno(dbsos_err: i32) -> u64 {
         -5 => LINUX_EINVAL,
         _ => LINUX_ENOSYS,
     }
+}
+
+/// Spawn a Linux ELF binary from VFS path as a new Ring3 task.
+/// Читает файл (до 256KB), load_linux_elf, GDT/TSS, spawn_user + LinuxTask.
+/// Возвращает pid или 0 при ошибке. Безопасный: при любой ошибке чистит ресурсы.
+pub fn spawn_file(path: &[u8]) -> u64 {
+    fn up(s: &str) { crate::driver::uart::write_str(s); }
+    if path.is_empty() || path.len() > 127 { return 0; }
+    let fd = crate::vfs::open(path, 0);
+    if fd < 0 { up("[linux-spawn] not found\r\n"); return 0; }
+    let mut st = crate::vfs::StatInfo { size: 0, is_dir: false, cluster: 0 };
+    if crate::vfs::stat(path, &mut st) != 0 { crate::vfs::close(fd); return 0; }
+    if st.is_dir { crate::vfs::close(fd); return 0; }
+    let fsize = st.size as usize;
+    if fsize < 64 || fsize > 256 * 1024 { crate::vfs::close(fd); up("[linux-spawn] bad size\r\n"); return 0; }
+    let buf = unsafe { crate::heap::kmalloc(fsize) };
+    if buf.is_null() { crate::vfs::close(fd); return 0; }
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf, fsize) };
+    let n = crate::vfs::read(fd, slice);
+    crate::vfs::close(fd);
+    if n <= 0 || (n as usize) < 64 { unsafe { crate::heap::kfree(buf); } return 0; }
+    let elf_data = unsafe { core::slice::from_raw_parts(buf as *const u8, n as usize) };
+    if elf_data[0..4] != [0x7F, b'E', b'L', b'F'] {
+        unsafe { crate::heap::kfree(buf); }
+        up("[linux-spawn] not ELF\r\n");
+        return 0;
+    }
+    let prog = match elf::load_linux_elf(elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe { crate::heap::kfree(buf); }
+            up("[linux-spawn] load: "); up(e); up("\r\n");
+            return 0;
+        }
+    };
+    unsafe { crate::heap::kfree(buf); }
+
+    // GDT/TSS для Ring3 (как в native elf::load_and_spawn)
+    let gdt_phys = crate::memory::palloc();
+    let tss_page = crate::memory::palloc();
+    if gdt_phys == 0 || tss_page == 0 {
+        if gdt_phys != 0 { crate::memory::pfree(gdt_phys); }
+        if tss_page != 0 { crate::memory::pfree(tss_page); }
+        return 0;
+    }
+    unsafe {
+        let orig = crate::vm::current_pml4() as *mut u64;
+        crate::vm::switch_to(prog.pml4);
+        let ksp = crate::syscall::sys_krsp;
+        crate::syscall::setup_user_gdt_tss(gdt_phys, tss_page, ksp, false);
+        core::arch::asm!("lgdt [{ptr}]", ptr = in(reg) &crate::interrupts::GdtPacked {
+            limit: (8*8-1) as u16, base: gdt_phys } as *const _ as u64);
+        crate::vm::switch_to(orig);
+        crate::syscall::sys_kret = crate::syscall::ring3_done as *const () as u64;
+    }
+    let tid = unsafe {
+        crate::scheduler::spawn_user(
+            prog.entry, prog.stack_top, prog.pml4,
+            gdt_phys, tss_page, prog.code_phys, prog.stack_phys,
+        )
+    };
+    let tid = match tid { Some(t) => t, None => {
+        crate::memory::pfree(gdt_phys); crate::memory::pfree(tss_page);
+        up("[linux-spawn] no task slot\r\n"); return 0;
+    }};
+    // LinuxTask метаданные
+    let lt = match task::create_task() {
+        Some(t) => t,
+        None => { up("[linux-spawn] no linux slot\r\n"); return 0; }
+    };
+    lt.entry = prog.entry;
+    lt.pml4_phys = prog.pml4 as u64;
+    lt.brk = prog.brk;
+    lt.mmap_base = prog.mmap_base;
+    lt.stack_top = prog.stack_top;
+    lt.stack_size = prog.stack_size;
+    lt.dbsos_task = tid;
+    let pid = lt.pid;
+    up("[linux-spawn] pid="); {
+        let mut v = pid; let mut b = [0u8; 20]; let mut i = 0;
+        if v == 0 { crate::driver::uart::putchar(b'0'); }
+        while v > 0 { b[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        while i > 0 { i -= 1; crate::driver::uart::putchar(b[i]); }
+    }
+    up("\r\n");
+    pid
 }

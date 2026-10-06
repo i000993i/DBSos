@@ -126,6 +126,10 @@ fn resolve_mount(path: &[u8]) -> Option<(usize, usize)> {
             if !m.in_use { continue; }
             let pfx = &m.prefix[..m.prefix_len];
             if path.len() >= m.prefix_len && &path[..m.prefix_len] == pfx {
+                // Boundary check: prefix must end at '/' or exact match
+                if m.prefix_len != 1 && path.len() > m.prefix_len && pfx[m.prefix_len - 1] != b'/' && path[m.prefix_len] != b'/' {
+                    continue;
+                }
                 if m.prefix_len > best_len {
                     best_len = m.prefix_len;
                     best_match = Some((m.driver_idx, m.prefix_len));
@@ -168,6 +172,19 @@ static mut OPEN_FILES: [Option<VfsFile>; MAX_OPEN_FILES] = [const { None }; MAX_
 
 /// Open a file through VFS. Returns fd index or -1.
 pub fn open(path: &[u8], flags: u64) -> i32 {
+    // Permission check
+    let uid = crate::user::current_uid();
+    let is_creat = (flags & 0x100) != 0;
+    let need_write = (flags & 1 != 0) || is_creat;
+    let existed_before = exists(path);
+    if need_write {
+        if !crate::permissions::can_write(path, uid) {
+            // If file doesn't exist and O_CREAT, check parent write instead
+            if !(is_creat && !existed_before && crate::permissions::can_write(parent_of(path), uid)) {
+                return -1;
+            }
+        }
+    } else if !crate::permissions::can_read(path, uid) { return -1; }
     unsafe {
         let (driver_idx, prefix_len) = match resolve_mount(path) {
             Some(v) => v,
@@ -201,6 +218,10 @@ pub fn open(path: &[u8], flags: u64) -> i32 {
             size,
             flags,
         });
+        // If file was just created, record its ownership
+        if is_creat && !existed_before {
+            crate::permissions::set(path, crate::permissions::Perm { owner: uid, group: uid, mode: 0o644 });
+        }
         fd_slot as i32
     }
 }
@@ -319,6 +340,8 @@ pub fn fstat(fd: i32) -> u64 {
 
 /// List directory entries.
 pub fn readdir(path: &[u8], entries: &mut [DirEntry]) -> i32 {
+    let uid = crate::user::current_uid();
+    if !crate::permissions::can_read(path, uid) { return -1; }
     unsafe {
         let (driver_idx, prefix_len) = match resolve_mount(path) {
             Some(v) => v,
@@ -376,9 +399,19 @@ pub fn readdir_to_buf(path: &[u8], buf: &mut [u8]) -> usize {
     oi
 }
 
+fn parent_of(path: &[u8]) -> &[u8] {
+    if let Some(pos) = path.iter().rposition(|&c| c == b'/') {
+        if pos == 0 { b"/" } else { &path[..pos] }
+    } else { b"/" }
+}
+
 /// Create a directory.
 pub fn mkdir(path: &[u8]) -> bool {
-    unsafe {
+    // Permission: need write on parent directory
+    let uid = crate::user::current_uid();
+    let parent = parent_of(path);
+    if !crate::permissions::can_write(parent, uid) { return false; }
+    let ok = unsafe {
         let (driver_idx, prefix_len) = match resolve_mount(path) {
             Some(v) => v,
             None => return false,
@@ -389,11 +422,20 @@ pub fn mkdir(path: &[u8]) -> bool {
             None => return false,
         };
         (driver.mkdir)(rel)
+    };
+    if ok {
+        // Record ownership for new directory
+        crate::permissions::set(path, crate::permissions::Perm { owner: uid, group: uid, mode: 0o755 });
     }
+    ok
 }
 
 /// Remove a directory.
 pub fn rmdir(path: &[u8]) -> bool {
+    let uid = crate::user::current_uid();
+    if !crate::permissions::can_write(path, uid) { return false; }
+    let parent = parent_of(path);
+    if !crate::permissions::can_write(parent, uid) { return false; }
     unsafe {
         let (driver_idx, prefix_len) = match resolve_mount(path) {
             Some(v) => v,
@@ -410,6 +452,10 @@ pub fn rmdir(path: &[u8]) -> bool {
 
 /// Delete a file.
 pub fn unlink(path: &[u8]) -> bool {
+    let uid = crate::user::current_uid();
+    if !crate::permissions::can_write(path, uid) { return false; }
+    let parent = parent_of(path);
+    if !crate::permissions::can_write(parent, uid) { return false; }
     unsafe {
         let (driver_idx, prefix_len) = match resolve_mount(path) {
             Some(v) => v,

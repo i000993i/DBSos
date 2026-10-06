@@ -78,7 +78,8 @@ fn conn(i: usize) -> &'static mut Conn {
 }
 
 fn next_isn() -> u32 {
-    ISN.fetch_add(0x102040, core::sync::atomic::Ordering::Relaxed)
+    let t = crate::timer::ticks() as u32 ^ crate::timer::millis() as u32;
+    ISN.fetch_add(0x102040u32.wrapping_add(t & 0xFFFF), core::sync::atomic::Ordering::Relaxed).wrapping_add(t)
 }
 
 fn next_ephemeral() -> u16 {
@@ -513,14 +514,25 @@ pub fn connect(peer_ip: [u8; 4], port: u16) -> Option<usize> {
     uart::write_str(" (SYN_SENT)\r\n");
 
     // Резолвим MAC получателя. Для своего IP (loopback) — свой MAC.
+    // Внешние IP — через gateway (иначе ARP для интернета не ответит).
     let own = crate::driver::net::our_ip();
+    let gw = crate::driver::net::gateway();
+    let mask = crate::driver::net::netmask();
+    let mut same_net = true;
+    for i in 0..4 {
+        if (peer_ip[i] & mask[i]) != (own[i] & mask[i]) { same_net = false; break; }
+    }
     let mac = if peer_ip == own {
         crate::driver::net::mac()
+    } else if !same_net {
+        crate::driver::net::resolve(gw, 2000).unwrap_or([0xFF; 6])
     } else if let Some(m) = crate::driver::net::arp_lookup_public(&peer_ip) {
         m
     } else {
-        // Пытаемся резолвить; если не вышло — fallback на broadcast (slirp).
-        crate::driver::net::resolve(peer_ip, 2000).unwrap_or([0xFF; 6])
+        // Пытаемся резолвить; если не вышло — fallback на gateway, потом broadcast.
+        crate::driver::net::resolve(peer_ip, 2000)
+            .or_else(|| crate::driver::net::resolve(gw, 1000))
+            .unwrap_or([0xFF; 6])
     };
     conn(i).remote_mac = mac;
 
@@ -535,8 +547,13 @@ pub fn send(idx: usize, data: &[u8]) -> bool {
         uart::write_str("[TCP] send: not established\r\n");
         return false;
     }
+    if data.is_empty() { return false; }
     if data.len() > 1400 {
-        uart::write_str("[TCP] send: too big\r\n");
+        uart::write_str("[TCP] send: too big (MTU 1400)\r\n");
+        return false;
+    }
+    if conn(idx).out_len != 0 {
+        uart::write_str("[TCP] send: busy (prev not acked)\r\n");
         return false;
     }
     // Заполняем out-буфер ДО отправки: в loopback ACK за эти данные приходит

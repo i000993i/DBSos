@@ -49,6 +49,14 @@ pub const MAX_CPU: usize = 8;
 static mut CPU_APIC_IDS: [u8; MAX_CPU] = [0xFF; MAX_CPU];
 static mut NCPU: usize = 0;
 static mut LAPIC_PHYS: u32 = 0;
+// IOAPIC: для полного взаимодействия с железом (MSI/IRQ routing).
+// Пока только детект+репорт; маршрутизация остаётся на PIC чтобы не сломать boot.
+const MAX_IOAPIC: usize = 4;
+static mut IOAPIC_PHYS: [u32; MAX_IOAPIC] = [0; MAX_IOAPIC];
+static mut NIOAPIC: usize = 0;
+static mut IRQ_OVERRIDE_COUNT: usize = 0;
+static mut IOAPIC_VER: u32 = 0;
+static mut IOAPIC_MAXREDIR: u32 = 0;
 static mut RESET_REG_ADDR: u64 = 0;
 static mut RESET_REG_SPACE: u8 = 0;
 static mut RESET_VALUE: u8 = 0;
@@ -191,6 +199,8 @@ unsafe fn parse_madt() {
 
     let mut off = 44usize;
     let mut ncpu = 0usize;
+    let mut nioapic = 0usize;
+    let mut noverride = 0usize;
     while off + 2 <= MADT_LEN as usize {
         let etype = MADT_COPY[off];
         let elen = MADT_COPY[off + 1] as usize;
@@ -204,6 +214,18 @@ unsafe fn parse_madt() {
                     CPU_APIC_IDS[ncpu] = apic_id;
                     ncpu += 1;
                 }
+            }
+            1 => {
+                // I/O APIC: id (1), reserved (1), addr (4), gsi_base (4)
+                let addr = u32_at(&MADT_COPY, off + 4);
+                if nioapic < MAX_IOAPIC {
+                    IOAPIC_PHYS[nioapic] = addr;
+                    nioapic += 1;
+                }
+            }
+            2 => {
+                // Interrupt Source Override: bus (1), source (1), gsi (4), flags (2)
+                noverride += 1;
             }
             9 => {
                 // Local x2APIC: count=1, reserved=3, x2APIC ID (4), flags (4) @ off+4
@@ -219,10 +241,36 @@ unsafe fn parse_madt() {
         off += elen;
     }
     NCPU = ncpu;
+    NIOAPIC = nioapic;
+    IRQ_OVERRIDE_COUNT = noverride;
     uart_print("[ACPI] MADT CPUs: "); uart_dec(ncpu as u64); uart_print("\r\n");
     for i in 0..ncpu {
         uart_print("  CPU"); uart_dec(i as u64);
         uart_print(" apic_id=0x"); uart_hex(CPU_APIC_IDS[i] as u64); uart_print("\r\n");
+    }
+    uart_print("[ACPI] MADT IOAPICs: "); uart_dec(nioapic as u64);
+    uart_print(" overrides: "); uart_dec(noverride as u64); uart_print("\r\n");
+    for i in 0..nioapic {
+        uart_print("  IOAPIC"); uart_dec(i as u64);
+        uart_print(" phys=0x"); uart_hex(IOAPIC_PHYS[i] as u64); uart_print("\r\n");
+    }
+    // Verify первого IOAPIC чтением ID (index 0) и VER (index 1).
+    // IOAPICID: биты 24-27 = ID. IOAPICVER: биты 0-7 = версия, 16-23 = max redir.
+    // (Раньше версия декодировалась из ID-регистра — там нули по спеку.)
+    if nioapic > 0 && IOAPIC_PHYS[0] != 0 {
+        unsafe {
+            let base = IOAPIC_PHYS[0] as u64 as *mut u32;
+            core::ptr::write_volatile(base.add(0), 0);
+            let id = core::ptr::read_volatile(base.add(4));
+            core::ptr::write_volatile(base.add(0), 1);
+            let ver = core::ptr::read_volatile(base.add(4));
+            IOAPIC_VER = (ver & 0xFF) as u32;
+            IOAPIC_MAXREDIR = ((ver >> 16) & 0xFF) as u32;
+            uart_print("[ACPI] IOAPIC0 id=0x"); uart_hex(((id >> 24) & 0xFF) as u64);
+            uart_print(" ver=0x"); uart_hex((ver & 0xFF) as u64);
+            uart_print(" maxredir=0x"); uart_hex(((ver >> 16) & 0xFF) as u64);
+            uart_print("\r\n");
+        }
     }
 }
 
@@ -250,6 +298,19 @@ pub fn apic_id_of(index: usize) -> Option<u8> {
 }
 
 pub fn lapic_phys() -> u32 { unsafe { LAPIC_PHYS } }
+
+/// IOAPIC для полноты железа: детект есть, routing пока через PIC (безопасно).
+pub fn ioapic_count() -> usize { unsafe { NIOAPIC } }
+pub fn ioapic_phys(idx: usize) -> Option<u32> {
+    if idx < MAX_IOAPIC && idx < unsafe { NIOAPIC } {
+        Some(unsafe { IOAPIC_PHYS[idx] })
+    } else { None }
+}
+pub fn irq_override_count() -> usize { unsafe { IRQ_OVERRIDE_COUNT } }
+
+/// IOAPIC версия/maxredir из VER-регистра (0 = не прочитан).
+pub fn ioapic_ver() -> u32 { unsafe { IOAPIC_VER } }
+pub fn ioapic_maxredir() -> u32 { unsafe { IOAPIC_MAXREDIR } }
 
 pub fn reboot() {
     unsafe {

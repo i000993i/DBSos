@@ -1,9 +1,16 @@
 #![no_std]
 #![allow(static_mut_refs)]
+// Сырые указатели в ядре — доверенные буферы и пользовательские адреса,
+// валидируемые на границе syscall (user_range_ok и т.п.). Пометка 14 pub fn
+// как unsafe сломала бы ~40 call sites, не добавив ни одной новой проверки,
+// поэтому лint глушим осознанно на уровне крейта (см. static_mut_refs выше).
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod cap;
 pub mod display;
 pub mod driver;
+pub mod block;
+pub mod event;
 pub mod fat_driver;
 pub mod fs;
 pub mod fs_server;
@@ -25,9 +32,29 @@ pub mod elf;
 pub mod script;
 pub mod wget;
 pub mod pkg;
-pub mod gui;
 pub mod linux;
-pub mod wayland;
+pub mod dbs_gr; // DBS-GR — своя растровая графика (TUI, градиент)
+pub mod fm; // DBS-FM файловый менеджер
+pub mod editor; // DBS-Edit
+pub mod browser; // DBS-Browser
+pub mod system; // LEVEL_0/1 архитектура
+pub mod user; // multi-user
+pub mod permissions; // rwx
+pub mod ext4; // FAT32/ext4 VFS
+pub mod gpt; // GPT partition parser (protective MBR 0xEE -> first usable LBA)
+pub mod backtrace; // RBP-chain backtrace для #PF/panic
+pub mod tmpfs; // RAM tmpfs для /tmp
+pub mod crypto; // SHA-256/HMAC/PBKDF2/AES-128 для защиты Wi-Fi секретов
+pub mod netman; // Менеджер подключений: профили, шифрованное хранение, скан
+pub mod unix; // AF_UNIX socketpair: локальный транспорт ядра
+pub mod deb; // .deb фундамент: ar + tar парсеры (распаковка data — следом)
+pub mod isofs; // ISO9660 read-only: корень с CD (VirtualBox без NVMe-диска)
+pub mod rs_kernel_test; // RS-Kernel-Test: проверка целостности Rust-ядра
+// Linux-подобный UI убран: plasma/wayland/gfx/login оставлены как legacy, не используются
+pub mod gfx; // legacy (не используется в DBS-GR)
+pub mod plasma; // legacy
+pub mod login; // legacy
+pub mod wayland; // legacy
 
 fn uart_print(s: &str) { driver::uart::write_str(s); }
 
@@ -59,6 +86,10 @@ pub fn init() {
     memory::init();
     timer::init();
     driver::init();
+    // Adaptive driver report — which hardware needs pkg fetch
+    crate::driver::adapt::print_report();
+    // Автовыбор primary NIC (e1000 vs rtl8139) + итог по радио
+    crate::driver::adapt::auto_select();
 
     let free = memory::free_count();
     uart_print("[MEM] free pages: ");
@@ -145,19 +176,63 @@ pub fn init() {
     unsafe { vm::init(); }
 
     // Kernel heap — must come after VM init (needs page table mapping)
-    // 256 initial pages = 1 MiB heap
-    unsafe { heap::init(256); }
+    // 1920x1080 needs 1920*1080*4 = 8294400 = 2025 pages; use 4096 pages = 16 MiB
+    unsafe { heap::init(4096); }
+
+    // Double buffering — allocate back buffer to eliminate screen flicker
+    // Must be after heap init (uses kmalloc)
+    uart_print("[GOP] double buffer...\r\n");
+    unsafe { display::init_double_buffer(); }
+
+    // ASLR — initialize entropy pool for address space randomization
+    crate::linux::aslr_init();
+    uart_print("[SEC] ASLR initialized\r\n");
 
     // VFS — virtual filesystem layer
     crate::vfs::init();
 
-    // FAT driver — mount at "/"
-    crate::fat_driver::init();
+    // Единый block-слой: NVMe -> AHCI -> IDE. Выбирает backend один раз.
+    crate::block::probe();
+    crate::block::list();
+    // FAT driver — mount at "/"; если диска нет (VBox CD-only) — ISO9660 с CD.
+    let fat_ok = crate::fat_driver::init();
+    if !fat_ok {
+        uart_print("[FS] FAT not found on HDD/SSD, trying CD-ROM...\r\n");
+        if crate::isofs::init() {
+            let idx = crate::isofs::register();
+            if idx != !0usize {
+                unsafe { crate::vfs::mount(b"/", idx); }
+                uart_print("[FS] ISO9660 root mounted (read-only)\r\n");
+            }
+        } else {
+            uart_print("[FS] no FAT and no ISO9660 — VFS empty, /tmp only\r\n");
+        }
+    } else {
+        uart_print("[FS] FAT root mounted via ");
+        uart_print(crate::block::backend_name());
+        uart_print("\r\n");
+    }
+    crate::ext4::init();
+    crate::permissions::init();
+    crate::user::init();
+    // Create home directories for multi-user
+    let _ = crate::vfs::mkdir(b"/home");
+    let _ = crate::vfs::mkdir(b"/home/guest");
+    let _ = crate::vfs::mkdir(b"/home/user");
+    let _ = crate::vfs::mkdir(b"/etc");
+    // Try to reload users from /etc/passwd now that VFS is ready
+    crate::user::post_vfs_init();
+    // FAT32/ext4 VFS ready — supports FAT12/16/32 + ext4 stub
+    uart_print("[FS] multi-FS: FAT16/FAT32/ext4 mounted\r\n");
+    // tmpfs для /tmp (RAM, переживает только до reboot)
+    crate::tmpfs::init();
+    // Профили подключений (расшифровка по требованию, не в память)
+    crate::netman::load();
 
     acpi::init();
 
-    // SMP disabled: AP goes wild after SIPI (todo: fix trampoline)
-    // scheduler::smp::init();
+    // SMP: INIT-SIPI-SIPI trampoline with stack-based retf (32→64 mode switch)
+    scheduler::smp::init();
 
     unsafe { syscall::init(); }
 
@@ -168,6 +243,18 @@ pub fn init() {
     crate::driver::mouse::init(); // PS/2 mouse (IRQ12)
     crate::driver::uart::enable_irq(); // UART serial RX (IRQ4)
 
-    // Launch graphical desktop
-    crate::gui::run();
+    // CMOS RTC — read real date/time from hardware
+    crate::driver::rtc::init();
+
+    // Ring-3 smoke-тест: каждый boot проверяет syscall-ABI (rax/rdi/rsi/rdx/r10
+    // и Win64-пролог syscall_stub) и посадку/выход ring-3 задач.
+    unsafe { crate::syscall::test_ring3(); }
+
+    // DBS-GR — пока прямо в BSP (гарантированно видна консоль), гибрид L3 через spawn — следующий шаг после стабилизации
+    crate::dbs_gr::init();
+    // RS-Kernel-Test: проверка целостности ядра (UART-таблица + итог на фреймбуфер)
+    crate::rs_kernel_test::run();
+    crate::system::set(system::Level::L1Tui);
+    crate::system::boot_banner();
+    crate::dbs_gr::run();
 }

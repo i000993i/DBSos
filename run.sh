@@ -14,6 +14,12 @@ python3 scripts/mk_esp.py                      # boot ESP (GPT+FAT16)
 
 Ovmf="${OVMF:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
 if [ ! -f "$Ovmf" ]; then
+  # Поиск OVMF в стандартных местах
+  for cand in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF_CODE.fd; do
+    if [ -f "$cand" ]; then Ovmf="$cand"; break; fi
+  done
+fi
+if [ ! -f "$Ovmf" ]; then
   echo "[run] ERROR: OVMF not found at $Ovmf"
   echo "[run] find it with: find / -name 'OVMF_CODE*.fd' 2>/dev/null"
   echo "[run] then run:      OVMF=/path/to/OVMF_CODE.fd ./run.sh"
@@ -33,6 +39,8 @@ echo "[run] Starting QEMU... serial output below."
 echo "[run] Type 'gui' in the OS shell to launch desktop."
 echo "[run] Session log saved to qemu_console.log"
 echo ""
+# timeout 120 -> код 124 при истечении, это нормально (не ошибка сборки)
+set +e
 script -q -c "timeout 120 qemu-system-x86_64 \
   -machine q35 \
   -drive if=pflash,format=raw,readonly=on,file=\"$Ovmf\" \
@@ -47,8 +55,10 @@ script -q -c "timeout 120 qemu-system-x86_64 \
   -monitor none \
   $QEMU_LOG \
   -nic user,model=e1000" qemu_console.log
+rc=$?
+set -e
 echo ""
-echo "[run] Session saved to qemu_console.log"
+echo "[run] Session saved to qemu_console.log (qemu exit=$rc)"
 if [ -s qemu_console.log ]; then
   echo "===== last 100 lines ====="
   tail -100 qemu_console.log
@@ -57,4 +67,6 @@ if [ -n "$SMP_DEBUG" ]; then
   echo "===== qemu.log tail ====="
   tail -80 qemu.log 2>/dev/null || echo "(no qemu.log)"
 fi
-exit $rc
+# 124 = timeout убил QEMU по истечении 120с — штатно. Пробрасываем 0.
+if [ "$rc" -eq 124 ]; then exit 0; fi
+exit "$rc"

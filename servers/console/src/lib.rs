@@ -55,11 +55,13 @@ pub unsafe fn write_user_code_console(dst: *mut u8) -> usize {
         dst.add(str_off + i).write(b);
     }
 
-    // mov rdx, str_virt
-    off += emit_mov_imm64(dst, off, 2, str_virt);
+    // Пользовательский ABI: rax=num, arg1=rdi, arg2=rsi, arg3=rdx, arg4=r10
 
-    // mov r8d, len
-    off += emit_mov_imm32(dst, off, 8, startup.len() as u32);
+    // mov rdi, str_virt   (arg1)
+    off += emit_mov_imm64(dst, off, 7, str_virt);
+
+    // mov esi, len        (arg2)
+    off += emit_mov_imm32(dst, off, 6, startup.len() as u32);
 
     // mov eax, 20   (SYS_LOG_WRITE)
     off += emit_mov_imm32(dst, off, 0, 20);
@@ -75,16 +77,16 @@ pub unsafe fn write_user_code_console(dst: *mut u8) -> usize {
     for i in 0..4 { dst.add(off + i).write((80u32 >> (i * 8)) as u8); }
     off += 4;
 
-    // mov rdx, cap_idx   (SYS_IPC_RECV arg1)
-    off += emit_mov_imm64(dst, off, 2, 0); // placeholder, patched later
+    // mov rdi, cap_idx    (SYS_IPC_RECV arg1)
+    off += emit_mov_imm64(dst, off, 7, 0); // placeholder, patched later
 
-    // mov r8, rsp        (arg2 = buffer)
-    dst.add(off).write(0x49); off += 1;
+    // mov rsi, rsp        (arg2 = buffer)
+    dst.add(off).write(0x48); off += 1;
     dst.add(off).write(0x89); off += 1;
-    dst.add(off).write(0xE0); off += 1;
+    dst.add(off).write(0xE6); off += 1;
 
-    // mov r9, 0          (arg3)
-    off += emit_mov_imm64(dst, off, 9, 0);
+    // mov rdx, 0          (arg3)
+    off += emit_mov_imm64(dst, off, 2, 0);
 
     // mov eax, 12        (SYS_IPC_RECV)
     off += emit_mov_imm32(dst, off, 0, 12);
@@ -92,13 +94,13 @@ pub unsafe fn write_user_code_console(dst: *mut u8) -> usize {
     // syscall
     off += emit_syscall(dst, off);
 
-    // mov rdx, rsp       (buffer for SYS_LOG_WRITE)
+    // mov rdi, rsp       (buffer for SYS_LOG_WRITE)
     dst.add(off).write(0x48); off += 1;
     dst.add(off).write(0x89); off += 1;
-    dst.add(off).write(0xE2); off += 1;
+    dst.add(off).write(0xE7); off += 1;
 
-    // mov r8d, 64        (length)
-    off += emit_mov_imm32(dst, off, 8, 64);
+    // mov esi, 64        (length)
+    off += emit_mov_imm32(dst, off, 6, 64);
 
     // mov eax, 20        (SYS_LOG_WRITE)
     off += emit_mov_imm32(dst, off, 0, 20);

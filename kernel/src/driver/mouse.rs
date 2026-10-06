@@ -23,6 +23,22 @@ static mut PACKET_BYTE: usize = 0;
 pub static mut IRQ_COUNT: u64 = 0;
 pub static mut RAW_BYTE_COUNT: u64 = 0;
 
+// ── Mouse event ring buffer ────────────────────────────────────
+const MOUSE_BUF_SIZE: usize = 256;
+
+#[derive(Copy, Clone)]
+pub struct MouseEvent {
+    pub dx: i32,
+    pub dy: i32,
+    pub left: bool,
+    pub right: bool,
+    pub middle: bool,
+}
+
+static mut MOUSE_BUF: [MouseEvent; MOUSE_BUF_SIZE] = [MouseEvent { dx: 0, dy: 0, left: false, right: false, middle: false }; MOUSE_BUF_SIZE];
+static mut MOUSE_BUF_R: usize = 0;
+static mut MOUSE_BUF_W: usize = 0;
+
 fn cli() { unsafe { asm!("cli"); } }
 fn sti() { unsafe { asm!("sti"); } }
 
@@ -206,10 +222,10 @@ extern "C" fn mouse_irq_handler() {
     unsafe {
         IRQ_COUNT += 1;
 
-        // Read ONE byte per IRQ to keep things simple and reliable.
-        // The i8042 fires IRQ12 once per byte; re-checking STATUS in a
-        // loop can miss the EOI window and lock up PIC2.
-        if inb(STATUS) & 1 != 0 {
+        let status = inb(STATUS);
+        // Фильтр AUX: бит 5 = 1 — данные от мыши; бит 0 = выходной буфер полон.
+        // Без проверки сюда попадают байты клавиатуры (IRQ1) при гонке i8042.
+        if status & 1 != 0 && status & 0x20 != 0 {
             let byte = inb(DATA);
             RAW_BYTE_COUNT += 1;
             PACKET[PACKET_BYTE] = byte;
@@ -228,6 +244,10 @@ extern "C" fn mouse_irq_handler() {
                     let dx = PACKET[1] as i8 as i32;
                     let dy = -(PACKET[2] as i8 as i32);
 
+                    let old_left = LEFT_BTN;
+                    let old_right = RIGHT_BTN;
+                    let old_middle = MIDDLE_BTN;
+
                     LEFT_BTN = b0 & 0x01 != 0;
                     RIGHT_BTN = b0 & 0x02 != 0;
                     MIDDLE_BTN = b0 & 0x04 != 0;
@@ -241,6 +261,33 @@ extern "C" fn mouse_irq_handler() {
                     if MOUSE_Y < 0 { MOUSE_Y = 0; }
                     if MOUSE_X >= w { MOUSE_X = w - 1; }
                     if MOUSE_Y >= h { MOUSE_Y = h - 1; }
+
+                    // Forward to Wayland seat (motion + button transitions)
+                    crate::wayland::seat::send_pointer_motion(dx, dy);
+                    if LEFT_BTN != old_left {
+                        crate::wayland::seat::send_pointer_button(0x110, LEFT_BTN);
+                    }
+                    if RIGHT_BTN != old_right {
+                        crate::wayland::seat::send_pointer_button(0x111, RIGHT_BTN);
+                    }
+                    if MIDDLE_BTN != old_middle {
+                        crate::wayland::seat::send_pointer_button(0x112, MIDDLE_BTN);
+                    }
+
+                    // Write to ring buffer
+                    let next = (MOUSE_BUF_W + 1) % MOUSE_BUF_SIZE;
+                    if next != MOUSE_BUF_R {
+                        MOUSE_BUF[MOUSE_BUF_W] = MouseEvent {
+                            dx, dy,
+                            left: LEFT_BTN,
+                            right: RIGHT_BTN,
+                            middle: MIDDLE_BTN,
+                        };
+                        MOUSE_BUF_W = next;
+                    }
+
+                    // Also push to unified event system
+                    crate::event::push_mouse(dx, dy, LEFT_BTN, RIGHT_BTN, MIDDLE_BTN);
 
                     PACKET_BYTE = 0;
                 }
@@ -281,3 +328,16 @@ pub fn right() -> bool { unsafe { RIGHT_BTN } }
 pub fn middle() -> bool { unsafe { MIDDLE_BTN } }
 pub fn irq_count() -> u64 { unsafe { IRQ_COUNT } }
 pub fn raw_byte_count() -> u64 { unsafe { RAW_BYTE_COUNT } }
+
+/// Non-blocking: read next mouse event from ring buffer
+pub fn poll_event() -> Option<MouseEvent> {
+    unsafe {
+        if MOUSE_BUF_R != MOUSE_BUF_W {
+            let ev = MOUSE_BUF[MOUSE_BUF_R];
+            MOUSE_BUF_R = (MOUSE_BUF_R + 1) % MOUSE_BUF_SIZE;
+            Some(ev)
+        } else {
+            None
+        }
+    }
+}

@@ -107,7 +107,7 @@ core::arch::global_asm!(
     "  mov es, ax",
     "  mov ss, ax",
     "  ap_trace 'E'",
-    "  mov edx, 0x5000",             // mini transition page tables
+    "  mov edx, dword ptr [0x7988]", // W_PML4: BSP page tables (identity low 2MB)
     "  mov cr3, edx",
     "  ap_trace 'F'",
     "  mov eax, 0xA0",               // CR4.PAE | CR4.PGE
@@ -120,12 +120,17 @@ core::arch::global_asm!(
     "  mov eax, cr0",
     "  or eax, 0x80000000",          // PG
     "  mov cr0, eax",
-    // Enter long mode with an IMMEDIATE far jump, exactly like Linux/xv6:
-    // the first instruction after enabling paging must be the mode switch so
-    // the TCG translator (and real silicon) refetch in 64-bit mode cleanly.
-    ".byte 0xEA",                   // ljmpl: imm32 offset, then imm16 selector
+    "  ap_trace 'G'",               // paging enabled (IA-32e active)
+    // Stack-based far transfer to 64-bit long mode: push selector, then
+    // push target offset, then far-return.  In .code32 mode the default
+    // operand size is 32 bits, so push imm32 (0x68) and retf (0xCB) work
+    // without any 0x66 prefix (which would DOWNGRADE to 16-bit in .code32!).
+    // Works on QEMU TCG where ljmpl (EA) fails at this transition.
+    ".byte 0x6A, 0x08",             // push 0x08 (sign-extended to 32 bits)
+    ".byte 0x68",                   // push imm32 (32-bit in .code32)
     ".long (_smp_64 - _smp_start) + 0x8000", // absolute 64-bit target in low RAM
-    ".word 0x0008",                 // CS = 0x08 (64-bit code, L=1)
+    "  ap_trace 'K'",               // far-return frame ready
+    ".byte 0xCB",                   // retf: pop EIP32, pop CS32 -> switch to long mode
 
     // ---- 64-bit long mode ----
     ".code64",
@@ -139,15 +144,24 @@ core::arch::global_asm!(
     "  mov fs, ax",
     "  mov gs, ax",
     "  lgdt [0x7974]",               // W_LGDT
+    "  ap_trace 'L'",               // 64-bit lgdt ok
     "  lidt [0x797E]",               // W_LIDT
     "  mov rsp, qword ptr [0x7990]", // W_STACK
-    "  mov rdi, qword ptr [0x7988]", // W_PML4 (BSP page tables)
-    "  mov rsi, qword ptr [0x7998]", // W_APIC
-    "  mov rdx, rsp",
-    "  mov rax, qword ptr [0x79A0]", // W_ENTRY
+    "  ap_trace 'M'",               // stack loaded
     "  mov rbx, 1",
     "  mov qword ptr [0x79A8], rbx", // W_CONSUMED=1: AP finished reading workspace
+    "  mov rdi, qword ptr [0x7988]", // W_PML4
     "  mov cr3, rdi",               // adopt BSP address space
+    "  ap_trace 'N'",               // BSP address space adopted
+    // NOTE: ap_trace clobbers rax/rcx/rdx — аргументы читаются ТОЛЬКО после
+    // трассы. Аргументы передаются по Win64 ABI (rcx/rdx/r8), а не по SysV:
+    // target x86_64-unknown-uefi имеет abi="win64", поэтому Rust-функции
+    // (в т.ч. ap_entry) ждут именно rcx/rdx/r8.
+    "  mov rcx, qword ptr [0x7988]", // arg1: pml4
+    "  mov rdx, qword ptr [0x7998]", // arg2: apic_id
+    "  mov r8, qword ptr [0x7990]",  // arg3: stack
+    "  sub rsp, 32",                 // Win64 shadow space
+    "  mov rax, qword ptr [0x79A0]", // W_ENTRY
     "  call rax",
     "loop_here:",
     "  cli",
@@ -193,12 +207,22 @@ unsafe fn build_ap_page_tables() {
 }
 
 /// Copy the .smp block to TRAMP_PHYS and fill workspace descriptors.
+/// Hardened: проверяет размер чтобы не затереть low-mem (стеки 0x9000+, workspace 0x7800).
 unsafe fn prepare_trampoline(ap_index: usize, apic_id: u32) {
     extern "C" { static _smp_start: u8; static _smp_32: u8; static _smp_64: u8; static _smp_end: u8; }
     let start = &raw const _smp_start as u64;
     let off32 = &raw const _smp_32 as u64 - start;
     let off64 = &raw const _smp_64 as u64 - start;
     let len = (&raw const _smp_end as u64) - start;
+    // TRAMP 0x8000..0x8000+len должен уместиться до AP0_STACK 0x9000 и не задеть W_BASE 0x7800.
+    if len == 0 || len > 0x1000 {
+        crate::driver::uart::write_str("[SMP] tramp len out of range, abort AP wake\r\n");
+        return;
+    }
+    if off32 >= len || off64 >= len {
+        crate::driver::uart::write_str("[SMP] tramp offsets corrupt, abort\r\n");
+        return;
+    }
     crate::driver::uart::write_str("[SMP] tramp start=0x");
     uart_hex(start);
     crate::driver::uart::write_str(" off32=0x");
@@ -317,7 +341,15 @@ unsafe fn prepare_trampoline(ap_index: usize, apic_id: u32) {
 unsafe fn ensure_bsp_low_identity() {
     use crate::vm::{identity_map_2mb, KERNEL_PML4, PTE_WRITABLE, virt_to_phys};
     let pml4 = KERNEL_PML4 as *mut u64;
-    if virt_to_phys(pml4, 0x18000) != 0 {
+    // The AP fetches the trampoline at 0x8000 and pushes at 0x7C00 after it
+    // enables paging with this CR3, so VA 0x8000 must be mapped (2MB page
+    // covers 0x8000..0x1FFFFF when it is a huge page).
+    crate::driver::uart::write_str("[SMP] bsp-map tramp@0x8000 phys=0x");
+    uart_hex(virt_to_phys(pml4, 0x8000));
+    crate::driver::uart::write_str(" stack@0x7C00 phys=0x");
+    uart_hex(virt_to_phys(pml4, 0x7C00));
+    crate::driver::uart::write_str("\r\n");
+    if virt_to_phys(pml4, 0x8000) != 0 && virt_to_phys(pml4, 0x7C00) != 0 {
         crate::driver::uart::write_str("[SMP] low 2MB already mapped in BSP PML4\r\n");
         return;
     }
@@ -329,11 +361,8 @@ unsafe fn ensure_bsp_low_identity() {
 }
 
 fn low_delay() {
-    let mut i = 0;
-    while i < 5_000_000 {
-        i += 1;
-        unsafe { asm!("pause"); }
-    }
+    // 10ms delay for INIT-SIPI-SIPI — используем HPET, а не 10M pause (вешает QEMU TCG)
+    crate::timer::usleep(10_000);
 }
 
 /// The trampoline workspace is shared by all APs. Before reusing it for the
@@ -437,6 +466,24 @@ fn uart_hex(v: u64) {
     }
 }
 
+/// Печатает содержимое workspace (PML4/STACK/APIC/ENTRY), как его видит BSP.
+fn dump_workspace(tag: &str) {
+    use crate::driver::uart;
+    uart::write_str(tag);
+    for (name, off) in [("PML4", W_PML4), ("STACK", W_STACK), ("APIC", W_APIC), ("ENTRY", W_ENTRY)] {
+        uart::write_str(" ");
+        uart::write_str(name);
+        uart::write_str("=");
+        let mut v = 0u64;
+        for i in 0..8 {
+            let b: u8 = unsafe { ((W_BASE + off as u64 + i as u64) as *const u8).read_volatile() };
+            v |= (b as u64) << (8 * i);
+        }
+        uart_hex(v);
+    }
+    uart::write_str("\r\n");
+}
+
 /// Bring up all other CPUs listed in the MADT.
 pub fn init() {
     unsafe {
@@ -480,13 +527,16 @@ pub fn init() {
             crate::driver::uart::write_str(" apic=");
             uart_dec(apic_id as u64);
             crate::driver::uart::write_str(" ...\r\n");
+            dump_workspace("[SMP] ws before INIT:");
             send_init_sipi(apic_id);
             if !wait_consumed() {
                 crate::driver::uart::write_str(
                     "[SMP] WARN: AP did not consume workspace in time, stopping\r\n",
                 );
+                dump_workspace("[SMP] ws after timeout:");
                 break;
             }
+            dump_workspace("[SMP] ws after AP:");
         }
         crate::driver::uart::write_str("[SMP] bring-up done\r\n");
     }
@@ -502,7 +552,26 @@ unsafe extern "C" fn ap_entry(pml4: u64, apic_id: u64, stack: u64) -> ! {
     crate::driver::uart::write_str(" pml4=");
     uart_hex(pml4);
     crate::driver::uart::write_str("\r\n");
+
+    // AP idle — без sti: IDT на AP пока не установлен (lidt в трампайзине
+    // обнуляет IDTR), любой IRQ вызвал бы #PF с пустым IDT → triple fault →
+    // сброс всей машины. Как только AP получит свою копию GDT/IDT, сюда можно
+    // вернуть прерывания и per-CPU планировщик.
+    unsafe { asm!("cli", options(nostack, preserves_flags)); }
     loop {
-        asm!("hlt", options(nostack, preserves_flags));
+        unsafe { asm!("hlt", options(nostack, preserves_flags)); }
     }
+}
+
+/// Безопасный отчёт о топологии CPU без рискованного SIPI.
+/// Вызывается из lib.rs вместо init() пока AP trampoline не стабилизирован на QEMU TCG.
+pub fn report() {
+    let ncpu = crate::acpi::ncpu();
+    crate::driver::uart::write_str("[SMP] BSP-only mode, MADT CPUs=");
+    uart_dec(ncpu as u64);
+    crate::driver::uart::write_str(" ioapics=");
+    uart_dec(crate::acpi::ioapic_count() as u64);
+    crate::driver::uart::write_str(" lapic=");
+    uart_hex(crate::acpi::lapic_phys() as u64);
+    crate::driver::uart::write_str("\r\n");
 }

@@ -94,6 +94,7 @@ pub fn init() {
     super::task::fpu_init();
     unsafe {
         CURRENT = 0;
+        let mut cwd_arr=[0u8;128]; cwd_arr[0]=b'/';
         TASKS[0] = Task {
             state: TaskState::Running,
             stack_base: 0 as *mut u8,
@@ -107,6 +108,9 @@ pub fn init() {
             fds: [const { super::FdEntry::empty() }; super::MAX_FDS],
             vmas: [const { super::vma::Vma::empty() }; super::vma::MAX_VMAS],
             vma_count: 0,
+            uid: 0, gid: 0,
+            cwd: cwd_arr,
+            cwd_len: 1,
         };
     }
 }
